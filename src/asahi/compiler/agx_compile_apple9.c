@@ -5278,6 +5278,27 @@ apple9_lower_fragment_uniform(nir_builder *b, nir_intrinsic_instr *intr, void *d
    return true;
 }
 
+/* External EGL images use ordinary 2D descriptors after the state tracker
+ * has handled format/plane conversion. Preserve the API's external target and
+ * sampler restrictions there; canonicalize only this compiler's dimension.
+ * External arrays and shadow samplers are not part of that contract.
+ */
+static bool
+apple9_lower_external_2d(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   (void)b;
+   if (instr->type != nir_instr_type_tex)
+      return false;
+
+   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   if (tex->sampler_dim != GLSL_SAMPLER_DIM_EXTERNAL ||
+       tex->is_array || tex->is_shadow)
+      return false;
+
+   tex->sampler_dim = GLSL_SAMPLER_DIM_2D;
+   return true;
+}
+
 /* Rectangle textures share the ordinary 2D descriptor. The common texture
  * pass normalizes their coordinates; explicit gradients need the same scale.
  * Integer fetches use level zero without any coordinate normalization. */
@@ -5368,6 +5389,8 @@ agx_nir_lower_apple9_sampler_state(
    } while (optimized);
    nir_lower_samplers(nir);
    nir_opt_constant_folding(nir);
+   nir_shader_instructions_pass(nir, apple9_lower_external_2d,
+                                nir_metadata_control_flow, NULL);
    nir_shader_instructions_pass(nir, apple9_lower_rectangle,
                                 nir_metadata_control_flow, NULL);
    const nir_lower_tex_options options = {
@@ -6654,6 +6677,8 @@ apple9_lower_textures(nir_shader *nir)
       .lower_txd_cube_map = true,
    };
    nir_shader_instructions_pass(nir, apple9_lower_array_shadow_gradients,
+                                nir_metadata_control_flow, NULL);
+   nir_shader_instructions_pass(nir, apple9_lower_external_2d,
                                 nir_metadata_control_flow, NULL);
    nir_shader_instructions_pass(nir, apple9_lower_rectangle,
                                 nir_metadata_control_flow, NULL);

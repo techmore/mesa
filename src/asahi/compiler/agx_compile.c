@@ -2873,17 +2873,9 @@ set_speculate(nir_builder *b, nir_instr *instr, UNUSED void *_)
    return false;
 }
 
-static bool
-agx_mark_def_uniform(nir_def *def, void *state)
-{
-   def->divergent = false;
-   return true;
-}
-
 static void
 agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
-                 uint8_t *ts_count, uint8_t *ss_count,
-                 bool allow_workgroup_intrinsics)
+                 uint8_t *ts_count, uint8_t *ss_count)
 {
    /* This runs only once up front since other optimizations don't affect it */
    NIR_PASS(_, nir, nir_opt_shrink_stores, true);
@@ -2927,26 +2919,8 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
       .lower_subgroup_masks = true,
    };
 
-   if (allow_workgroup_intrinsics) {
-      /* Driver-internal helpers may read tile/workgroup system registers from a
-       * non-workgroup stage. NIR's divergence analysis rejects that, and these
-       * helpers contain no atomics or subgroup operations, so the uniform
-       * passes below have nothing to do. Mark the divergence metadata valid by
-       * treating every value as uniform, which is correct for these shaders.
-       */
-      nir_foreach_function_impl(impl, nir) {
-         nir_metadata_require(impl, nir_metadata_instr_index);
-         nir_foreach_block(block, impl) {
-            nir_foreach_instr(instr, block) {
-               nir_foreach_def(instr, agx_mark_def_uniform, NULL);
-            }
-         }
-         impl->valid_metadata |= nir_metadata_divergence;
-      }
-   } else {
-      nir_divergence_analysis(nir);
-      NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
-   }
+   nir_divergence_analysis(nir);
+   NIR_PASS(progress, nir, nir_opt_uniform_atomics, true);
 
    /* Lower addressing modes. The sooner we do this, the sooner we get rid of
     * amul/aadd instructions and can let nir_opt_algebraic do its job. But we
@@ -2955,11 +2929,9 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
     */
    NIR_PASS(_, nir, agx_nir_lower_address);
 
-   if (!allow_workgroup_intrinsics) {
-      NIR_PASS(progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
-      if (progress) {
-         NIR_PASS(_, nir, agx_nir_lower_subgroups);
-      }
+   NIR_PASS(progress, nir, nir_opt_uniform_subgroup, &subgroups_options);
+   if (progress) {
+      NIR_PASS(_, nir, agx_nir_lower_subgroups);
    }
 
    /* The above create operations that need lowering/optimizing */
@@ -3747,6 +3719,19 @@ void
 agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
                        struct agx_shader_part *out)
 {
+   /* Preserve ordinary NIR divergence analysis for tile helpers. Scope the
+    * opt-in options to this compile; the caller's options never change.
+    */
+   const nir_shader_compiler_options *original_options = nir->options;
+   nir_shader_compiler_options helper_options;
+   if (key->allow_workgroup_intrinsics) {
+      assert(nir->info.stage == MESA_SHADER_FRAGMENT);
+      helper_options = *original_options;
+      helper_options.divergence_analysis_options |=
+         nir_divergence_fragment_workgroup_id_uniform;
+      nir->options = &helper_options;
+   }
+
    /*
     * Apple9 is a distinct ISA from Apple8.  The general Apple9 backend is not
     * implemented here yet.  G16/G17 direct-render bring-up currently reaches
@@ -3828,8 +3813,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       (key->secondary || !key->promote_textures) ? NULL
                                                  : &info->texture_state_count,
       (key->secondary || !key->promote_textures) ? NULL
-                                                 : &info->sampler_state_count,
-      key->allow_workgroup_intrinsics);
+                                                 : &info->sampler_state_count);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       info->varyings.fs.nr_cf = key->fs.cf_base;
@@ -3914,4 +3898,5 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    out->binary = binary.data;
    info->binary_size = binary.size;
+   nir->options = original_options;
 }

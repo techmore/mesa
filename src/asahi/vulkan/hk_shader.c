@@ -937,32 +937,50 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
             nir_opt_if_optimize_phi_true_false | nir_opt_if_avoid_64bit_phis);
 }
 
-static void
+static VkResult
+hk_upload_shader_binary(struct hk_device *dev, struct hk_shader *shader)
+{
+   size_t size = shader->b.info.binary_size;
+   assert(size > 0);
+
+   shader->bo = agx_bo_create(&dev->dev, size, 0,
+                              AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
+   if (!shader->bo)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   memcpy(agx_bo_map(shader->bo), shader->b.binary, size);
+   shader->preamble_addr =
+      shader->bo->va->addr + shader->b.info.preamble_offset;
+
+   if (shader->b.info.rodata.size_16) {
+      /* Uniform descriptors cannot represent the fixed 1-TiB USC aperture.
+       * Keep the mirror in the ordinary heap. On failure, callers destroy
+       * this partially initialized shader; never substitute the USC BO.
+       */
+      shader->rodata_bo = agx_bo_create(
+         &dev->dev, size, 0, AGX_BO_WRITEBACK, "Shader rodata");
+      if (!shader->rodata_bo)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      uint64_t address = shader->rodata_bo->va->addr;
+      const uint64_t limit = 1ull << 40;
+      if (address >= limit || size > limit - address)
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+      memcpy(agx_bo_map(shader->rodata_bo), shader->b.binary, size);
+      shader->rodata_addr = address;
+   }
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
 {
    if (shader->b.info.has_preamble || shader->b.info.rodata.size_16) {
-      /* TODO: Do we wnat to compact? Revisit when we rework prolog/epilogs. */
-      size_t size = shader->b.info.binary_size;
-      assert(size > 0);
-
-      shader->bo = agx_bo_create(&dev->dev, size, 0,
-                                 AGX_BO_EXEC | AGX_BO_LOW_VA, "Preamble");
-      memcpy(agx_bo_map(shader->bo), shader->b.binary, size);
-      shader->preamble_addr =
-         shader->bo->va->addr + shader->b.info.preamble_offset;
-
-      /* The rodata referenced by the immediate uniform descriptors must live
-       * below the 40-bit USC address limit. shader->bo sits in the fixed 1-TiB
-       * USC aperture (>= 2^40) for execution, so keep a low mirror for the
-       * descriptor to reference. */
-      if (shader->b.info.rodata.size_16) {
-         shader->rodata_bo = agx_bo_create(
-            &dev->dev, size, 0, AGX_BO_WRITEBACK, "Shader rodata");
-         if (shader->rodata_bo) {
-            memcpy(agx_bo_map(shader->rodata_bo), shader->b.binary, size);
-            shader->rodata_addr = shader->rodata_bo->va->addr;
-         }
-      }
+      VkResult result = hk_upload_shader_binary(dev, shader);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    if (!shader->linked.ht) {
@@ -981,6 +999,8 @@ hk_upload_shader(struct hk_device *dev, struct hk_shader *shader)
          shader->b.info.sampler_state_count, false);
       cfg.texture_state_register_count = shader->b.info.texture_state_count;
    }
+
+   return VK_SUCCESS;
 }
 
 DERIVE_HASH_TABLE(hk_fast_link_key_vs);
@@ -1251,8 +1271,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    if (result != VK_SUCCESS)
       return vk_error(dev, result);
 
-   hk_upload_shader(dev, shader);
-   return VK_SUCCESS;
+   return hk_upload_shader(dev, shader);
 }
 
 static const struct vk_shader_ops hk_shader_ops;
@@ -1646,8 +1665,7 @@ hk_deserialize_shader(struct hk_device *dev, struct blob_reader *blob,
       return vk_error(dev, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
 
    shader->b.binary = (void *)shader->code_ptr;
-   hk_upload_shader(dev, shader);
-   return VK_SUCCESS;
+   return hk_upload_shader(dev, shader);
 }
 
 static VkResult
@@ -1853,9 +1871,8 @@ hk_fast_link(struct hk_device *dev, bool fragment, struct hk_shader *main,
    struct agx_usc_builder b = agx_usc_builder(s->usc.data, sizeof(s->usc.data));
 
    if (main && main->b.info.rodata.size_16) {
-      uint64_t rodata_base = main->rodata_bo ? main->rodata_addr
-                                             : main->bo->va->addr;
-      agx_usc_immediates(&b, &main->b.info.rodata, rodata_base);
+      assert(main->rodata_bo != NULL);
+      agx_usc_immediates(&b, &main->b.info.rodata, main->rodata_addr);
    }
 
    if (s->b.uses_txf)

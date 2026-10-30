@@ -608,7 +608,11 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_shared_base_ptr:
    case nir_intrinsic_load_workgroup_index:
    case nir_intrinsic_load_workgroup_id:
-      assert(mesa_shader_stage_uses_workgroup(stage) || stage == MESA_SHADER_TESS_CTRL);
+      assert(mesa_shader_stage_uses_workgroup(stage) ||
+             stage == MESA_SHADER_TESS_CTRL ||
+             (stage == MESA_SHADER_FRAGMENT &&
+              instr->intrinsic == nir_intrinsic_load_workgroup_id &&
+              (options & nir_divergence_fragment_workgroup_id_uniform)));
       if (stage == MESA_SHADER_COMPUTE)
          is_divergent |= (options & nir_divergence_multiple_workgroup_per_compute_subgroup);
       break;

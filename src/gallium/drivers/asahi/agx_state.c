@@ -1460,8 +1460,6 @@ agx_nir_uses_workgroup_intrinsics(nir_shader *nir)
                continue;
             switch (nir_instr_as_intrinsic(instr)->intrinsic) {
             case nir_intrinsic_load_workgroup_id:
-            case nir_intrinsic_load_workgroup_index:
-            case nir_intrinsic_load_shared_base_ptr:
                return true;
             default:
                break;
@@ -1502,11 +1500,10 @@ agx_compile_nir(struct agx_device *dev, nir_shader *nir,
 
    /* The Apple9 color tile helpers are fragment programs that read the tile
     * coordinate through a workgroup system register. NIR's divergence analysis
-    * rejects workgroup intrinsics outside workgroup stages, so flag these to
-    * bypass it.
+    * normally rejects that stage combination. Opt in only this uniform
+    * system-register read, preserving analysis of all other shader values.
     */
-   if (!mesa_shader_stage_uses_workgroup(nir->info.stage) &&
-       nir->info.stage != MESA_SHADER_TESS_CTRL &&
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        agx_nir_uses_workgroup_intrinsics(nir))
       key.allow_workgroup_intrinsics = true;
 

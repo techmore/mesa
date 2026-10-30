@@ -100,6 +100,12 @@ typedef enum {
 
    /* Whether InvocationID in TCS is considered uniform */
    nir_divergence_tcs_invocation_id_uniform = (1 << 14),
+
+   /* A driver-generated fragment tile helper may read a workgroup ID that
+    * is uniform across its hardware subgroup. This does not make other
+    * fragment inputs uniform or permit shared/workgroup-index intrinsics.
+    */
+   nir_divergence_fragment_workgroup_id_uniform = (1 << 15),
 } nir_divergence_options;
 
 /** An instruction filtering callback

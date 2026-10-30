@@ -388,9 +388,9 @@ struct agx_shader_key {
     */
    bool is_helper;
 
-   /* Set for driver-internal helpers that read tile/workgroup system registers
-    * from a non-workgroup stage. NIR's divergence analysis only permits
-    * workgroup intrinsics in workgroup stages, so such helpers must skip it.
+   /* Fragment tile helpers may read a uniform workgroup ID. Opt in to that
+    * system-register read while preserving normal divergence analysis of
+    * layer ID and every other value. Other workgroup intrinsics stay invalid.
     */
    bool allow_workgroup_intrinsics;
 

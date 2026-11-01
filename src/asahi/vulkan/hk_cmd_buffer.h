@@ -596,8 +596,12 @@ hk_cmd_buffer_get_cs_general(struct hk_cmd_buffer *cmd, struct hk_cs **ptr,
                              bool compute)
 {
    if ((*ptr) == NULL) {
-      /* Allocate root control stream */
-      size_t initial_size = 65536;
+      /* Allocate root control stream. Apple9 compute streams are usually
+       * one launch record between barriers; grow them on demand. */
+      size_t initial_size =
+         compute && hk_apple9_compute_enabled(&hk_cmd_buffer_device(cmd)->dev)
+            ? 4096
+            : 65536;
       struct agx_ptr root = hk_pool_alloc(cmd, initial_size, 1024);
       if (!root.cpu)
          return NULL;

@@ -253,6 +253,59 @@ byte-identical SPIR-V. In a wheel built from it on the M4:
 
 Greedy text is identical on all three models and decode is unchanged.
 
+## Descriptor-table shaders: buffer roots from the preamble
+
+Compute shaders with more than 18 resources (17 buffers plus push constants)
+use descriptor tables. Every buffer access first loaded the binding's pointer
+from the table, cached only within one block so loops reloaded it every
+iteration, and then issued an address-pair load that was retired before the
+next one issued. Apple's compiler, given pointers in an argument buffer, loads
+them once in its constant program into uniform registers and uses ordinary
+indexed loads with those registers as the root (`root=5`, `root=6` in a
+`metal-tt -arch applegpu_g16g` build of such a kernel).
+
+Apple9 now does the same for compute: the preamble loads each resource pointer
+from the buffer table and stores it to uniform words 12 + 2a / 13 + 2a, and the
+main program's loads, stores and atomics use root 6 + a. The preamble's own
+accesses keep the table path; a shader without an extracted preamble gets an
+empty one to carry the stores, and every fallback recompiles with the table
+path. `AGX_APPLE9_NO_TABLE_ROOTS=1` restores it. `AGX_APPLE9_STATS` lines now
+end in `table=1` for descriptor-table shaders.
+
+Many-binding probe (`vkmany`, every thread reads all inputs in a loop, results
+checked against the CPU): 8 workgroups / 256 workgroups, Gload/s.
+
+| Buffers | Before | After |
+|---:|---:|---:|
+| 17 (direct ABI) | 1.19 / 37.3 | 1.19 / 36.3 |
+| 18 | 1.03 / 31.7 | 1.21 / 37.2 |
+| 24 | 1.07 / 32.2 | 1.28 / 39.4 |
+| 30 | 1.10 / 39.7 | 1.59 / 46.0 |
+
+omarchy-mlx's fused decode GEMV (26 resources) loses its per-iteration table
+loads and its loads overlap; with the fused routes on, decode rises 8-14%
+(granite 1B 34.0 to 36.6 tok/s, Qwen2.5 1.5B 32.1 to 36.6, Llama 3.2 3B 10.3
+to 11.5). Greedy text is identical on six models with the table path and with
+roots, all 35 compute tests pass and the kernel logged no GPU faults.
+
+The per-node path is still faster than the fused groups on this GPU, so
+omarchy-mlx now defaults both fused decode routes off on G16 (techmore/
+omarchy-mlx, branch `m4-bf16-qmm-fma`). Decode tok/s with no environment
+settings, old default (fused) to new default:
+
+| Model | Fused | New default |
+|---|---:|---:|
+| granite-4.0-1b-4bit | 36.6 | 45.7 |
+| Qwen2.5-0.5B-Instruct-4bit | 68.8 | 87.8 |
+| Qwen2.5-1.5B-Instruct-4bit | 36.6 | 50.2 |
+| Llama-3.2-1B-Instruct-4bit | 28.3 | 30.2 |
+| Llama-3.2-3B-Instruct-4bit | 11.6 | 13.7 |
+| Qwen3.5-2B-MLX-4bit | 26.1 | 33.0 |
+| Mistral-7B-Instruct-v0.3-4bit | 14.8 | 16.7 |
+
+Greedy text is unchanged on six of the seven; Qwen2.5 1.5B takes a different,
+equally coherent wording from word 41, from the two routes' accumulation order.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -276,8 +329,8 @@ switch for the base M4 until Gravity publishes a qualified build.
 
 ## Open work
 
-- Make the descriptor-table ABI (more than 18 resources) as fast as the
-  direct-buffer ABI, or lift the 18-resource direct limit.
+- Descriptor-table graphics shaders still use the table path (the preamble
+  roots are enabled for compute only).
 - Reduce the GEMV floor on small layers (512 x 2048 still takes about 35 us).
   Load scheduling is ruled out (see "Latency-aware candidate selection");
   candidates are the kernel's per-slot structure, splitting K in the MLX

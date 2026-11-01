@@ -854,6 +854,9 @@ struct apple9_dag_lower {
    unsigned atomic_count;
    unsigned argument_base;
    bool buffer_table;
+   /* Nonzero: buffer argument a uses uniform root binding_root_base + a,
+    * published by the preamble, instead of loading its table pointer. */
+   unsigned binding_root_base;
    unsigned groups_argument;
    unsigned shared_argument;
    unsigned preamble_base;
@@ -991,6 +994,21 @@ apple9_buffer_address(struct apple9_dag_lower *lower, unsigned argument)
       return AGX_APPLE9_VREG_INVALID;
    lower->binding_pointer[argument] = address;
    return address;
+}
+
+/* Root operand naming a buffer argument's pointer: launch-published in the
+ * direct ABI, preamble-published for descriptor-table roots. */
+static unsigned
+apple9_buffer_root(const struct apple9_dag_lower *lower, unsigned argument)
+{
+   return lower->binding_root_base ? lower->binding_root_base + argument
+                                   : lower->argument_base + argument;
+}
+
+static bool
+apple9_buffer_via_table(const struct apple9_dag_lower *lower)
+{
+   return lower->buffer_table && !lower->binding_root_base;
 }
 
 static uint32_t
@@ -2022,9 +2040,9 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          uint32_t address = AGX_APPLE9_VREG_INVALID;
          if (load->address)
             address = apple9_lower_global_address(lower, load->address);
-         else if (lower->buffer_table)
+         else if (apple9_buffer_via_table(lower))
             address = apple9_buffer_address(lower, load->argument);
-         if ((load->address || lower->buffer_table) &&
+         if ((load->address || apple9_buffer_via_table(lower)) &&
              address == AGX_APPLE9_VREG_INVALID)
             return address;
 
@@ -2044,7 +2062,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             };
             const uint32_t base = agx_apple9_vir_emit_device_load_vector(
                &lower->program,
-               lower->argument_base + load->argument, index,
+               apple9_buffer_root(lower, load->argument), index,
                components, &contract);
             if (base == AGX_APPLE9_VREG_INVALID ||
                 !agx_apple9_vir_set_device_load_contract(
@@ -2077,7 +2095,7 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          value = apple9_dag_emit(
             lower, AGX_APPLE9_VIR_DEVICE_LOAD, AGX_APPLE9_ENC_DEVICE_LOAD,
             source, 1,
-            lower->argument_base + load->argument);
+            apple9_buffer_root(lower, load->argument));
          if (value != AGX_APPLE9_VREG_INVALID) {
             struct agx_apple9_vir_instr *memory =
                lower->program.instructions[lower->program.instruction_count - 1];
@@ -2626,6 +2644,10 @@ struct apple9_buffer_map {
    uint32_t write_mask;
    bool writes_global;
    bool descriptor_tables;
+   /* Descriptor-table compute with preamble-published buffer roots: the
+    * number of resource arguments whose pointers occupy uniform pairs from
+    * word AGX_APPLE9_GRAPHICS_ROOT_WORDS. Zero keeps the table path. */
+   unsigned table_root_count;
    struct apple9_buffer_resource resource[AGX_APPLE9_MAX_GRAPHICS_BUFFERS];
 };
 
@@ -3026,7 +3048,7 @@ apple9_find_buffer_dag(nir_shader *nir, const struct apple9_buffer_map *map,
    }
 
    if (!uniform_stores && stores->size == 0 && atomics->size == 0 &&
-       nir->info.stage == MESA_SHADER_COMPUTE) {
+       !map->table_root_count && nir->info.stage == MESA_SHADER_COMPUTE) {
       *reason = "Apple9 requires at least one SSBO side effect";
       return false;
    }
@@ -3074,13 +3096,13 @@ apple9_emit_buffer_store(struct apple9_dag_lower *lower,
    uint32_t address = AGX_APPLE9_VREG_INVALID;
    if (store->address)
       address = apple9_lower_global_address(lower, store->address);
-   else if (lower->buffer_table)
+   else if (apple9_buffer_via_table(lower))
       address = apple9_buffer_address(lower, store->argument);
-   if ((store->address || lower->buffer_table) &&
+   if ((store->address || apple9_buffer_via_table(lower)) &&
        address == AGX_APPLE9_VREG_INVALID)
       return false;
    if (!agx_apple9_vir_emit_device_store(&lower->program,
-                                         lower->argument_base + store->argument,
+                                         apple9_buffer_root(lower, store->argument),
                                          store->lowered_index, store->output,
                                          store->components, store->bit_size))
       return false;
@@ -3156,13 +3178,13 @@ apple9_emit_buffer_atomic(struct apple9_dag_lower *lower,
    uint32_t address = atomic->address
                          ? apple9_lower_global_address(lower, atomic->address)
                          : AGX_APPLE9_VREG_INVALID;
-   if (!atomic->address && lower->buffer_table)
+   if (!atomic->address && apple9_buffer_via_table(lower))
       address = apple9_buffer_address(lower, atomic->argument);
-   if ((atomic->address || lower->buffer_table) &&
+   if ((atomic->address || apple9_buffer_via_table(lower)) &&
        address == AGX_APPLE9_VREG_INVALID)
       return false;
    if (!agx_apple9_vir_emit_device_atomic(
-          &lower->program, lower->argument_base + atomic->argument, index,
+          &lower->program, apple9_buffer_root(lower, atomic->argument), index,
           data, data_components, atomic->op, discard, &result)) {
       lower->reason = "could not emit an Apple9 VIR device atomic";
       return false;
@@ -4565,8 +4587,14 @@ apple9_compile_dag_body(nir_shader *nir, struct agx_shader_part *out,
          ? AGX_APPLE9_COMPUTE_SHARED_ARGUMENT - 2
          : apple9_buffer_argument(resources, AGX_APPLE9_COMPUTE_RESOURCE_SHARED, 0),
       .preamble_base = resources->descriptor_tables
-                         ? AGX_APPLE9_GRAPHICS_ROOT_WORDS
+                         ? AGX_APPLE9_GRAPHICS_ROOT_WORDS +
+                              2 * resources->table_root_count
                          : agx_apple9_compute_preamble_base(resources->count),
+      /* The preamble publishes the roots, so its own accesses keep the
+       * table path. */
+      .binding_root_base = resources->table_root_count && !preamble
+                              ? AGX_APPLE9_GRAPHICS_ROOT_WORDS / 2
+                              : 0,
       .structured_cf = apple9_cf_list_has_control_flow(&impl->body),
    };
    /* Reserve depth before assigning point-coordinate coefficients, independent
@@ -4600,6 +4628,33 @@ apple9_compile_dag_body(nir_shader *nir, struct agx_shader_part *out,
    if (lower.structured_cf && apple9_dag_zero(&lower) == AGX_APPLE9_VREG_INVALID) {
       *reason = "could not initialize Apple9 control-flow zero";
       goto fail;
+   }
+   /* Publish every buffer pointer from the descriptor table once, as the
+    * uniform pair the main program names as its load/store root. */
+   if (preamble && resources->table_root_count) {
+      /* The pointer cache starts zeroed and no block exists yet, so a
+       * lookup would otherwise return vreg 0 as a cached pointer. */
+      memset(lower.binding_pointer, 0xff, sizeof(lower.binding_pointer));
+      lower.binding_pointer_block = lower.program.current_block;
+      for (unsigned a = 0; a < resources->table_root_count; ++a) {
+         if (resources->resource[a].kind == AGX_APPLE9_COMPUTE_RESOURCE_SHARED)
+            continue;
+         uint32_t pointer = apple9_buffer_address(&lower, a);
+         if (pointer == AGX_APPLE9_VREG_INVALID) {
+            *reason = "could not load an Apple9 descriptor-table pointer";
+            goto fail;
+         }
+         for (unsigned w = 0; w < 2; ++w) {
+            uint32_t half = pointer + w;
+            if (!agx_apple9_vir_emit_side_effect(
+                   &lower.program, AGX_APPLE9_VIR_STORE_UNIFORM,
+                   AGX_APPLE9_ENC_STORE_UNIFORM, &half, 1,
+                   AGX_APPLE9_GRAPHICS_ROOT_WORDS + 2 * a + w)) {
+               *reason = "could not publish an Apple9 buffer root";
+               goto fail;
+            }
+         }
+      }
    }
    /* System values are cached by selector across the whole shader. Read them
     * before divergent control flow so a first use in one arm cannot leave
@@ -4933,11 +4988,11 @@ apple9_compile_dag_body(nir_shader *nir, struct agx_shader_part *out,
          saves += ins->op == AGX_APPLE9_VIR_SPILL_STORE;
          fills += ins->op == AGX_APPLE9_VIR_SPILL_LOAD;
       }
-      fprintf(stderr, "%s_CODEGEN stage=%u bytes=%u instructions=%u copies=%u waits=%u saves=%u fills=%u gprs=%u scratch=%u\n",
+      fprintf(stderr, "%s_CODEGEN stage=%u bytes=%u instructions=%u copies=%u waits=%u saves=%u fills=%u gprs=%u scratch=%u table=%d\n",
               preamble ? "APPLE9_PREAMBLE" : "APPLE9",
               nir->info.stage, emitter.bytes.size, lower.program.instruction_count,
               copies, waits, saves, fills, lower.program.peak_live_gprs,
-              lower.program.scratch_size);
+              lower.program.scratch_size, lower.buffer_table);
    }
 
 
@@ -5150,13 +5205,19 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
       return apple9_compile_dag_body(nir, out, profile, varyings, &resources,
                                     false, reason);
    }
+   static int table_roots = -1;
+   if (table_roots < 0)
+      table_roots = getenv("AGX_APPLE9_NO_TABLE_ROOTS") == NULL;
+   if (table_roots && resources.descriptor_tables &&
+       nir->info.stage == MESA_SHADER_COMPUTE)
+      resources.table_root_count = resources.count;
    const nir_opt_preamble_options options = {
       .cb_data = &eligibility,
       .def_size = apple9_preamble_def_size,
       .preamble_storage_size[nir_preamble_class_general] =
          AGX_APPLE9_UNIFORM_COUNT -
          (resources.descriptor_tables
-             ? AGX_APPLE9_GRAPHICS_ROOT_WORDS
+             ? AGX_APPLE9_GRAPHICS_ROOT_WORDS + 2 * resources.table_root_count
              : agx_apple9_compute_preamble_base(resources.count)),
       .instr_cost_cb = apple9_preamble_cost,
       .rewrite_cost_cb = apple9_preamble_rewrite_cost,
@@ -5167,11 +5228,14 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
    struct agx_apple9_compute_profile candidate_profile = {0};
    const char *candidate_reason = NULL;
    nir_shader *preamble = NULL;
-   if (main && nir_opt_preamble(main, &options, sizes)) {
-      nir_function_impl *impl = nir_shader_get_preamble(main);
+   const bool extracted = main && nir_opt_preamble(main, &options, sizes);
+   /* Published buffer roots need a preamble even when NIR extracted none. */
+   if (main && (extracted || resources.table_root_count)) {
+      nir_function_impl *impl = extracted ? nir_shader_get_preamble(main) : NULL;
       /* Setup currently admits ordinary linear ALU/UBO work. Masked setup and
        * scratch have independent execution contracts and are not assumed. */
-      if (impl && !apple9_cf_list_has_control_flow(&impl->body)) {
+      if (extracted ? impl && !apple9_cf_list_has_control_flow(&impl->body)
+                    : true) {
          preamble = nir_shader_create(NULL, nir->info.stage, nir->options);
          preamble->info.stage = nir->info.stage;
          preamble->info.float_controls_execution_mode = nir->info.float_controls_execution_mode;
@@ -5179,8 +5243,12 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
                 sizeof(preamble->info.workgroup_size));
          nir_function *fn = nir_function_create(preamble, "main");
          fn->is_entrypoint = true;
-         fn->impl = nir_function_impl_clone(preamble, impl);
-         fn->impl->function = fn;
+         if (impl) {
+            fn->impl = nir_function_impl_clone(preamble, impl);
+            fn->impl->function = fn;
+         } else {
+            nir_function_impl_create(fn);
+         }
          nir_opt_dce(main);
          nir_opt_dce(preamble);
          if (apple9_compile_dag_body(preamble, &setup, NULL, NULL, &resources,
@@ -5221,6 +5289,8 @@ apple9_compile_dag(nir_shader *nir, struct agx_shader_part *out,
    free(eligibility.state);
    ralloc_free(preamble);
    ralloc_free(main);
+   /* Without a preamble nothing publishes the roots. */
+   resources.table_root_count = 0;
    return apple9_compile_dag_body(nir, out, profile, varyings, &resources,
                                  false, reason);
 }

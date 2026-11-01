@@ -271,6 +271,50 @@ apple9_shared_block(struct apple9_shared_ra *ra, struct agx_apple9_block *block)
    return block ? ra->blocks[block->index] : NULL;
 }
 
+/* These pack to one machine instruction, which reads every source before
+ * it writes its result. Expansions that write a result in parts may not
+ * alias a source, so they keep late-killed sources. */
+static bool
+apple9_may_reuse_killed_source(const agx_instr *I)
+{
+   if (I->op != AGX_OPCODE_APPLE9_PURE || !I->apple9)
+      return false;
+   switch (I->apple9->op) {
+   case AGX_APPLE9_VIR_FADD:
+   case AGX_APPLE9_VIR_FSUB:
+   case AGX_APPLE9_VIR_FMUL:
+   case AGX_APPLE9_VIR_FADD_IMM:
+   case AGX_APPLE9_VIR_FMUL_IMM:
+   case AGX_APPLE9_VIR_FMA:
+   case AGX_APPLE9_VIR_FMIN:
+   case AGX_APPLE9_VIR_FMAX:
+   case AGX_APPLE9_VIR_HADD:
+   case AGX_APPLE9_VIR_HSUB:
+   case AGX_APPLE9_VIR_HMUL:
+   case AGX_APPLE9_VIR_HFMA:
+   case AGX_APPLE9_VIR_HMIN:
+   case AGX_APPLE9_VIR_HMAX:
+   case AGX_APPLE9_VIR_IADD:
+   case AGX_APPLE9_VIR_ISUB:
+   case AGX_APPLE9_VIR_IMUL:
+   case AGX_APPLE9_VIR_IMAD:
+   case AGX_APPLE9_VIR_IAND:
+   case AGX_APPLE9_VIR_IOR:
+   case AGX_APPLE9_VIR_IXOR:
+   case AGX_APPLE9_VIR_ISHL:
+   case AGX_APPLE9_VIR_ISHR:
+   case AGX_APPLE9_VIR_USHR:
+   case AGX_APPLE9_VIR_IMIN:
+   case AGX_APPLE9_VIR_IMAX:
+   case AGX_APPLE9_VIR_UMIN:
+   case AGX_APPLE9_VIR_UMAX:
+   case AGX_APPLE9_VIR_SELECT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
                        const char **reason)
@@ -289,6 +333,9 @@ apple9_shared_dataflow(struct apple9_shared_ra *ra, nir_shader *nir,
       .spill_copy_register = 2,
       .spill_swap_registers = {4, 6},
       .late_kill_sources = true,
+      .reuse_killed_source = getenv("AGX_APPLE9_NO_SOURCE_REUSE")
+                                ? NULL
+                                : apple9_may_reuse_killed_source,
       .preserve_source_kills = true,
       .defer_spill_lowering = true,
       .disable_occupancy_rematerialization = true,

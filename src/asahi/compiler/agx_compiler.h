@@ -506,6 +506,11 @@ struct agx_ra_target {
    unsigned spill_copy_register;
    unsigned spill_swap_registers[2];
    bool late_kill_sources;
+   /* With late_kill_sources: when this approves an instruction, its scalar
+    * result may still take the register of a source that dies at it (the
+    * instruction reads every source before it writes), preferring the
+    * source in the result's phi web. NULL disables. */
+   bool (*reuse_killed_source)(const agx_instr *I);
    bool preserve_source_kills;
    bool defer_spill_lowering;
    /* An occupancy table from another target is not a rematerialization cost

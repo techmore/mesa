@@ -962,6 +962,66 @@ place_constrained_value(struct ra_ctx *rctx, agx_index value,
    return chosen;
 }
 
+static void kill_source(struct ra_ctx *rctx, const agx_instr *I, unsigned s);
+
+/* Give a pure scalar result the register of a source that dies here, when
+ * the result's constraint admits it. Returns true if the result is placed. */
+static bool
+reuse_killed_scalar_source(struct ra_ctx *rctx, agx_instr *I)
+{
+   if (!rctx->shader->ra_target.reuse_killed_source || I->nr_dests != 1 ||
+       !rctx->shader->ra_target.reuse_killed_source(I) ||
+       I->dest[0].type != AGX_INDEX_NORMAL || I->dest[0].memory ||
+       ra_class_for_index(I->dest[0]) != RA_GPR)
+      return false;
+   /* Register units are 16-bit halves: one 32-bit scalar is two. */
+   unsigned count = rctx->ncomps[I->dest[0].value];
+   if (count > 2)
+      return false;
+
+   struct agx_reg_constraint dc = I->reg_constraints[0];
+   unsigned first = MAX2(dc.min, reserved_size(rctx->shader));
+   unsigned last = MIN2(dc.max, rctx->bound[RA_GPR] - 1);
+   unsigned web = phi_web_find(rctx->phi_web, I->dest[0].value);
+   int chosen = -1;
+   bool chosen_in_web = false;
+
+   agx_foreach_ssa_src(I, s) {
+      if (!I->src[s].kill || I->src[s].memory ||
+          ra_class_for_index(I->src[s]) != RA_GPR ||
+          rctx->ncomps[I->src[s].value] != count)
+         continue;
+      struct agx_reg_constraint sc = I->reg_constraints[I->nr_dests + s];
+      /* A source read from a fixed reserved register is a copy, not its
+       * home register. */
+      if (sc.min == sc.max && sc.max < reserved_size(rctx->shader))
+         continue;
+      unsigned reg = rctx->ssa_to_reg[I->src[s].value];
+      if (reg < first || reg + count - 1 > last ||
+          (reg % MAX2(count, dc.align)))
+         continue;
+      bool in_web = phi_web_find(rctx->phi_web, I->src[s].value) == web;
+      if (chosen < 0 || (in_web && !chosen_in_web)) {
+         chosen = s;
+         chosen_in_web = in_web;
+      }
+   }
+   if (chosen < 0)
+      return false;
+
+   unsigned value = I->src[chosen].value;
+   unsigned reg = rctx->ssa_to_reg[value];
+   kill_source(rctx, I, chosen);
+   /* Killed now; the late-kill pass must not free the result. */
+   agx_foreach_ssa_src(I, s) {
+      if (I->src[s].value == value && !I->src[s].memory)
+         I->src[s].kill = false;
+   }
+   assign_regs(rctx, I->dest[0], reg);
+   BITSET_SET_COUNT(rctx->pinned, reg, count);
+   return true;
+}
+
 static void
 assign_constrained_operands(struct ra_ctx *rctx, agx_instr *I)
 {
@@ -1008,8 +1068,11 @@ assign_constrained_operands(struct ra_ctx *rctx, agx_instr *I)
          continue;
       place_constrained_value(rctx, I->src[s], c, true);
    }
-   agx_foreach_ssa_dest(I, d) {
-      place_constrained_value(rctx, I->dest[d], I->reg_constraints[d], false);
+   if (!reuse_killed_scalar_source(rctx, I)) {
+      agx_foreach_ssa_dest(I, d) {
+         place_constrained_value(rctx, I->dest[d], I->reg_constraints[d],
+                                 false);
+      }
    }
 
    struct util_dynarray copies = UTIL_DYNARRAY_INIT;

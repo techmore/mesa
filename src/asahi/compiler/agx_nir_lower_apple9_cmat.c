@@ -21,9 +21,10 @@
  * sb = bi * N / 8 + bj.
  *
  * The hardware tile needs all 32 lanes, so callers only use this for compute
- * shaders whose workgroup size is a static multiple of 32. Only fp32 elements
- * are supported; anything else makes the pass fail (returns false through
- * *unsupported) so the shader is rejected rather than miscompiled.
+ * shaders whose workgroup size is a static multiple of 32. Elements are fp32
+ * or fp16; fp16 A and B operands widen to fp32 for the multiply, the
+ * accumulator must be fp32. Anything else sets *unsupported so the shader is
+ * rejected rather than miscompiled.
  */
 
 #include "compiler/nir/nir_builder.h"
@@ -69,8 +70,9 @@ src_desc(nir_src s)
 static bool
 desc_supported(struct glsl_cmat_description d)
 {
-   return d.element_type == GLSL_TYPE_FLOAT && d.rows == d.cols &&
-          (d.rows == 8 || d.rows == 16);
+   return (d.element_type == GLSL_TYPE_FLOAT ||
+           d.element_type == GLSL_TYPE_FLOAT16) &&
+          d.rows == d.cols && (d.rows == 8 || d.rows == 16);
 }
 
 static nir_def *
@@ -196,12 +198,19 @@ lower_muladd(nir_builder *b, nir_intrinsic_instr *intr)
    struct glsl_cmat_description db = src_desc(intr->src[2]);
    struct glsl_cmat_description dc = src_desc(intr->src[3]);
    if (!desc_supported(da) || !desc_supported(db) || !desc_supported(dc) ||
-       da.rows != dc.rows || nir_intrinsic_saturate(intr))
+       dc.element_type != GLSL_TYPE_FLOAT || da.rows != dc.rows ||
+       db.rows != dc.rows || nir_intrinsic_saturate(intr))
       return false;
 
+   /* fp16 A or B (an fp16 activation tile against fp32 weights, for example)
+    * widens exactly to fp32 for the fp32-accumulator instruction. */
    const unsigned nblk = da.rows / 8;
    nir_def *a = load_src(b, intr->src[1], da);
    nir_def *bb = load_src(b, intr->src[2], db);
+   if (a->bit_size == 16)
+      a = nir_f2f32(b, a);
+   if (bb->bit_size == 16)
+      bb = nir_f2f32(b, bb);
    nir_def *c = load_src(b, intr->src[3], dc);
 
    nir_def *dch[8];

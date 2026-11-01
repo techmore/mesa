@@ -619,6 +619,31 @@ loads, not the access pattern, register count or dispatch cost.
 omarchy-mlx `qmm_vec` now decodes nibbles in place without shifts (same
 bits, about 2% decode).
 
+## Short kernels pay for their code size
+
+Two synthetic kernels doing the same integer work, one unrolled
+(straight-line) and one as a loop, on G16 (`gen_icache.py`, `vkchain`, 4
+workgroups, the same shader dispatched 300 times in a row):
+
+| ops per thread | unrolled | code | looped (~340 B) |
+|---:|---:|---:|---:|
+| 250 | 10.7 us | 9.6 KB | 4.9 us |
+| 1000 | 34.7 us | 38 KB | 11.8 us |
+| 4000 | 127 us | 152 KB | 39.6 us |
+
+With 160 or more workgroups the unrolled kernel is as fast as the looped
+one, so the cost is a cold fetch of the code at the start of each
+dispatch, about 0.9 us per KB, even for a 9.6 KB kernel that should fit in
+the cache. Mesa's launch records do not request an instruction-cache
+flush, so the invalidation (or the slow fetch) comes from below the driver.
+Short, large kernels pay it at every launch: decode RoPE compiled to
+41.7 KB (one shader carrying every RoPE form behind runtime flags) and cost
+~37 us per launch for 256-1024 threads.
+
+omarchy-mlx now builds the half-split RoPE forms separately (bf16 41.7 ->
+16.8 KB, bit-identical): granite 1B decode 47.9 -> 51.8 tok/s, Qwen2.5 0.5B
+116.5 -> 121.8.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -651,6 +676,9 @@ switch for the base M4 until Gravity publishes a qualified build.
 - System memory ceiling: GPU reads stop near 82-85 GB/s, the CPU near 71,
   against about 100 GB/s on macOS. Likely a memory performance state that
   nothing on Linux requests.
+- Find what makes each dispatch fetch its code cold (firmware, kernel or
+  hardware; see "Short kernels pay for their code size"), and compare with
+  the same probe under Metal on macOS.
 - Loops still rematerialize constants every iteration and spend a few
   instructions on control.
 - Cooperative matrix: fold load waits into the instruction's wait mask, map

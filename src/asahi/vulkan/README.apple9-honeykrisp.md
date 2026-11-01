@@ -219,6 +219,27 @@ mlx-community 4-bit models use f16; bf16 models such as granite still take
 the tile kernel at about 66 GFLOP/s. The null-binding redirect is not covered
 by a hardware test yet: MLX never binds null descriptors.
 
+### bf16 needs an FMA kernel in omarchy-mlx
+
+omarchy-mlx routes only f16 to the FMA kernel. A bf16 port of the same kernel,
+built at runtime through `mx.fast.metal_kernel` (x read as a uint32 view, two
+bf16 values per load; scales and biases widened to f32 once), matches the CPU
+within rounding and runs 8x faster than the shipped bf16 tile route:
+
+| m x n x k | Tile (shipped) | bf16 FMA prototype |
+|---|---:|---:|
+| 64 x 8192 x 3072 | 66.6 GFLOP/s | 535.2 GFLOP/s |
+| 512 x 2048 x 2048 | 66.0 | 558.2 |
+| 130 x 2050 x 2048 | 58.7 | 341.8 |
+| 77 x 1000 x 512 | 54.5 | 188.0 |
+
+Routing granite-4.0-1b-4bit's multi-row 4-bit layers through it raises
+prefill from 17.9 to 48.3 tok/s (44 tokens) and from 19.5 to 74.1 tok/s
+(512 tokens), with the same greedy text. Shipping it means a bf16 build of
+`qmm_fma.comp` and lifting the `out.dtype() == float16` condition on the FMA
+route in `QuantizedMatmul::eval_gpu`; the compiled shader would also read x as
+uvec4 like the f16 build, which the runtime translator cannot express.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -248,7 +269,9 @@ switch for the base M4 until Gravity publishes a qualified build.
   Load scheduling is ruled out (see "Latency-aware candidate selection");
   candidates are the kernel's per-slot structure, splitting K in the MLX
   kernels, and per-dispatch cost.
-- Cooperative matrix for Apple9, for prefill.
+- bf16 prefill: a bf16 build of omarchy-mlx's FMA kernel (see "bf16 needs an
+  FMA kernel in omarchy-mlx").
+- Cooperative matrix for Apple9, for prefill beyond the FMA kernels.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single
   instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not

@@ -235,10 +235,23 @@ within rounding and runs 8x faster than the shipped bf16 tile route:
 
 Routing granite-4.0-1b-4bit's multi-row 4-bit layers through it raises
 prefill from 17.9 to 48.3 tok/s (44 tokens) and from 19.5 to 74.1 tok/s
-(512 tokens), with the same greedy text. Shipping it means a bf16 build of
-`qmm_fma.comp` and lifting the `out.dtype() == float16` condition on the FMA
-route in `QuantizedMatmul::eval_gpu`; the compiled shader would also read x as
-uvec4 like the f16 build, which the runtime translator cannot express.
+(512 tokens), with the same greedy text.
+
+The compiled version is techmore/omarchy-mlx commit `bf1406e` (branch
+`m4-bf16-qmm-fma`): a `-DUSE_BF16=1` build of `qmm_fma.comp` that reads x as
+uvec4 like the f16 build, routed for bf16 wherever the f16 FMA route is
+reachable (`MLX_OMARCHY_NO_QMM_FMA_BF16=1` opts out). The f16 builds compile to
+byte-identical SPIR-V. In a wheel built from it on the M4:
+
+| | Tile (before) | bf16 FMA |
+|---|---:|---:|
+| 4-bit matmul, 64 x 8192 x 3072 | 66.4 GFLOP/s | 810.0 GFLOP/s |
+| 4-bit matmul, 512 x 8192 x 3072 | 66.8 | 889.9 |
+| granite-4.0-1b-4bit prefill, 512 tokens | 19.5 tok/s | 169.7 tok/s |
+| Qwen3.5-2B-MLX-4bit prefill, 512 tokens | 14.6 | 62.6 |
+| Qwen3.5-4B-MLX-4bit prefill, 512 tokens | 6.5 | 26.5 |
+
+Greedy text is identical on all three models and decode is unchanged.
 
 ## Kernel
 
@@ -269,9 +282,12 @@ switch for the base M4 until Gravity publishes a qualified build.
   Load scheduling is ruled out (see "Latency-aware candidate selection");
   candidates are the kernel's per-slot structure, splitting K in the MLX
   kernels, and per-dispatch cost.
-- bf16 prefill: a bf16 build of omarchy-mlx's FMA kernel (see "bf16 needs an
-  FMA kernel in omarchy-mlx").
-- Cooperative matrix for Apple9, for prefill beyond the FMA kernels.
+- Upstream the bf16 FMA route to omarchy-mlx (techmore/omarchy-mlx `bf1406e`).
+- Cooperative matrix for Apple9, for prefill beyond the FMA kernels. Joshua
+  Warren's G13 Honeykrisp (github.com/joshuaswarren/mesa-1, branches
+  `asahi/hwmat-vec2-on` and `agent/hk-bf16-cmat`) gets about 2x over the FMA
+  kernel on an M1 from simdgroup matrix instructions; the Apple9 encodings
+  would come from the Xcode Metal toolchain as the subgroup ones did.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single
   instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not

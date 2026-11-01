@@ -125,11 +125,59 @@ pass and the kernel logged no GPU faults.
 
 `AGX_APPLE9_NO_PRESSURE_SCHED=1` skips `agx_pressure_schedule`, which places
 loads next to their consumers. It doubles bandwidth with few resident threads
-but lowers GEMV bandwidth (2048 x 2048: 38.3 GB/s) and leaves decode unchanged
-(granite 41.8 tok/s), so it stays an opt-in experiment. A scheduler that keeps
-program order for loads unless that would spill is the likely next step.
-Hoisting loads earlier in NIR and waiting at the first consumer were also tried
-and changed nothing measurable.
+but leaves decode unchanged (granite 41.8 tok/s), so it stays an opt-in
+experiment. Hoisting loads earlier in NIR and waiting at the first consumer
+were also tried and changed nothing measurable.
+
+## Latency-aware candidate selection
+
+`agx_apple9_allocate_shared` already builds a latency-aware allocation
+(`schedule_delay`, device loads weighted 16) next to the plain
+pressure-scheduled one. It keeps the latency candidate only when it is cheaper
+by spills, then instructions, bytes, registers, and only then dependency gaps.
+`AGX_APPLE9_SCHED_DEBUG=1` prints every candidate's cost;
+`AGX_APPLE9_SCHED_FORCE=plain|latency` forces one family for experiments.
+
+For the four-load bandwidth kernel the latency candidate has the same
+instructions and bytes, 22 instead of 59 dependency gaps, and 28 instead of 24
+registers, so the register tie-break discards it. Forced, it matches
+`NO_PRESSURE_SCHED`:
+
+| Workgroups | Plain (default) | Latency forced |
+|---:|---:|---:|
+| 4 | 17.7 GB/s | 36.0 GB/s |
+| 16 | 57.9 GB/s | 79.0 GB/s |
+| 1024 | 78.3 GB/s | 76.7 GB/s |
+
+It does not carry over to real kernels. 4-bit GEMV shapes (2048 x 2048,
+3072 x 8192, 4096 x 4096, 1024 x 3072) are within run-to-run noise either way,
+and decode is unchanged or worse:
+
+| Model | Default | Latency forced | Plain forced |
+|---|---:|---:|---:|
+| granite-4.0-1b-4bit | 45.1 | 45.1 | 44.9 |
+| Qwen2.5-0.5B-Instruct-4bit | 86.3 | 87.8 | 86.8 |
+| Llama-3.2-3B-Instruct-4bit | 13.9 | 13.3 | 14.3 |
+
+The selection order is therefore unchanged. After the load-hazard fix, decode
+GEMV is not limited by load scheduling within a thread.
+
+### Register cost on T8132
+
+A probe kernel runs a dependent load chain per thread (latency-bound, L1
+resident) while N extra values stay live across the loop, 262144 threads.
+Throughput tracks resident threads:
+
+| GPRs | 8 | 13 | 19 | 27 | 35 | 43 | 51 | 59 | 67 | 75 | 89 | 95 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| GB/s | 143 | 120 | 99 | 78 | 79 | 59-76 | 66 | 69 | 60 | 54 | 44 | 36 |
+
+There are no sharp occupancy tiers like the older GPUs' table; cost rises
+roughly continuously, about 1-2% of throughput per extra register, with
+noise of up to 30% between neighbouring sizes as code layout changes. Above
+about 95 GPRs the allocator rematerializes or spills. Extra registers are
+not free on the M4, which supports keeping registers ahead of dependency gaps
+in the selection order.
 
 ## Kernel
 
@@ -156,9 +204,10 @@ switch for the base M4 until Gravity publishes a qualified build.
 
 - Make the descriptor-table ABI (more than 18 resources) as fast as the
   direct-buffer ABI, or lift the 18-resource direct limit.
-- Reduce the GEMV latency floor on small layers further: a load-aware
-  pressure scheduler (see "Device loads now overlap within a thread"), or
-  split K in the MLX kernels.
+- Reduce the GEMV floor on small layers (512 x 2048 still takes about 35 us).
+  Load scheduling is ruled out (see "Latency-aware candidate selection");
+  candidates are the kernel's per-slot structure, splitting K in the MLX
+  kernels, and per-dispatch cost.
 - Cooperative matrix for Apple9, for prefill.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single

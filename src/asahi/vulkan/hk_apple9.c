@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_apple9.h"
+#include "agx_abi.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -467,6 +468,10 @@ hk_apple9_dispatch(struct hk_cmd_buffer *cmd, struct hk_shader *s,
                  binding);
          return;
       }
+      /* Null descriptors read as zero. The compiler also redirects guarded
+       * loads to element 0 of their binding, which must stay mapped. */
+      if (resources[i] == 0)
+         resources[i] = AGX_ZERO_PAGE_ADDRESS;
    }
 
    struct hk_cs *cs = hk_cmd_buffer_get_cs(cmd, true /* compute */);

@@ -3569,6 +3569,16 @@ apple9_emit_block(struct apple9_dag_lower *lower, struct util_dynarray *stores,
          if (intr->intrinsic == nir_intrinsic_barrier) {
             unsigned scope = nir_intrinsic_execution_scope(intr);
             unsigned modes = nir_intrinsic_memory_modes(intr);
+            /* A subgroup executes together and its threadgroup accesses stay
+             * in program order (Apple's G16 compiler emits nothing for
+             * simdgroup_barrier); device memory keeps its fence below. GLSL
+             * subgroupBarrier() also names images, moot without any. */
+            if (scope == SCOPE_SUBGROUP) {
+               if (lower->nir->info.num_images == 0)
+                  modes &= ~nir_var_image;
+               scope = SCOPE_NONE;
+               modes &= ~nir_var_mem_shared;
+            }
             if ((scope != SCOPE_NONE && scope != SCOPE_WORKGROUP) ||
                 (modes & ~(nir_var_mem_shared | nir_var_mem_global | nir_var_mem_ssbo)) ||
                 (scope == SCOPE_NONE && (modes & nir_var_mem_shared))) {

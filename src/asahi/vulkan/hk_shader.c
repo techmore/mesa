@@ -9,6 +9,7 @@
 #include "hk_shader.h"
 
 #include "poly/nir/poly_nir.h"
+#include "agx_compile_apple9.h"
 #include "agx_debug.h"
 #include "agx_device.h"
 #include "agx_helpers.h"
@@ -20,6 +21,7 @@
 #include "nir_builder.h"
 
 #include "agx_bo.h"
+#include "hk_apple9.h"
 #include "hk_cmd_buffer.h"
 #include "hk_descriptor_set_layout.h"
 #include "hk_device.h"
@@ -196,10 +198,25 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 }
 
 static void
-hk_apple9_preprocess_nir(nir_shader *nir)
+hk_apple9_preprocess_nir(nir_shader *nir, bool coopmat)
 {
    bool progress;
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+
+   /* Cooperative matrices become per-lane register pairs before variables are
+    * lowered to SSA. The matrix instruction needs all 32 lanes of every
+    * subgroup; other shaders keep the cmat intrinsics and fail to compile. */
+   const uint64_t threads = (uint64_t)nir->info.workgroup_size[0] *
+                            nir->info.workgroup_size[1] *
+                            nir->info.workgroup_size[2];
+   if (coopmat && !nir->info.workgroup_size_variable && threads &&
+       (threads % 32) == 0) {
+      bool unsupported = false;
+      NIR_PASS(_, nir, agx_nir_lower_apple9_cmat, &unsupported);
+      NIR_PASS(_, nir, nir_opt_deref);
+      if (unsupported)
+         mesa_logw("Apple9: cooperative matrix shape or operation unsupported");
+   }
    do {
       progress = false;
       NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
@@ -227,7 +244,7 @@ hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
 
    if (nir->info.stage == MESA_SHADER_COMPUTE &&
        hk_apple9_compute_enabled(&pdev->dev)) {
-      hk_apple9_preprocess_nir(nir);
+      hk_apple9_preprocess_nir(nir, hk_apple9_coopmat_enabled(&pdev->dev));
       return;
    }
 

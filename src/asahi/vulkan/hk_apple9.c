@@ -14,6 +14,7 @@
 #include "asahi/lib/agx_bo.h"
 #include "asahi/lib/agx_device.h"
 #include "compiler/nir/nir.h"
+#include "util/u_debug.h"
 #include "compiler/nir/nir_builder.h"
 #include "gallium/drivers/asahi/agx_apple9.h"
 #include "libagx/libagx_dgc.h"
@@ -31,6 +32,15 @@ bool
 hk_apple9_compute_enabled(const struct agx_device *dev)
 {
    return agx_apple9_compute_enabled(dev);
+}
+
+bool
+hk_apple9_coopmat_enabled(const struct agx_device *dev)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = debug_get_bool_option("HK_APPLE9_COOPMAT", false);
+   return enabled && hk_apple9_compute_enabled(dev);
 }
 
 /* ---- Compile ----------------------------------------------------------- */

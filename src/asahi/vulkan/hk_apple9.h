@@ -63,6 +63,10 @@ struct hk_apple9_shader {
 
 bool hk_apple9_compute_enabled(const struct agx_device *dev);
 
+/* VK_KHR_cooperative_matrix on Apple9 compute (fp32 8x8x8, subgroup scope).
+ * Opt-in with HK_APPLE9_COOPMAT=1 until it has wider hardware coverage. */
+bool hk_apple9_coopmat_enabled(const struct agx_device *dev);
+
 VkResult hk_apple9_compile_compute(struct hk_device *dev, struct nir_shader *nir,
                                    uint32_t set_layout_count,
                                    struct vk_descriptor_set_layout *const *set_layouts,

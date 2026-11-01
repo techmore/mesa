@@ -601,8 +601,10 @@ It does not change with the memory type (host-cached or not), occupancy
 (2,560 to 1.3 million threads), loads in flight per thread (1-8), or CPU
 frequency (0.9-4.1 GHz). All ten CPU cores read 71 GB/s. A published
 macOS measurement of the base M4 reaches about 100 GB/s (arXiv
-2502.05317), so the system ceiling here is roughly 18% lower, probably a
-memory power state; nothing on the Linux side requests one.
+2502.05317, February 2025, so an older macOS than the current 27.2), so the
+system ceiling here is roughly 18% lower, probably a memory power state;
+nothing on the Linux side requests one. Once Linux meets those figures,
+re-baseline the same probes on an M4 under macOS 27.2.
 
 A dependent Vulkan dispatch costs about 2.6 us of fixed time (a 1 MiB read
 takes 15.4 us against 12.8 us of bandwidth); pipeline barriers add nothing.
@@ -640,9 +642,12 @@ switch for the base M4 until Gravity publishes a qualified build.
 
 ## Open work
 
-- Decode GEMV: overlap the next iteration's weight loads with the current
-  iteration's math (software prefetch keeps results bit-exact), and keep
-  cutting instructions per byte (see "Op issue rates and memory bandwidth").
+- Decode GEMV: keep cutting instructions per weight byte (see "Op issue
+  rates and memory bandwidth"). Software prefetch of the next iteration's
+  weights was tried and gave nothing (the scheduler already issues them
+  early).
+- Re-baseline against macOS 27.2 on an M4 (Metal ports of the probes) once
+  Linux meets the published macOS figures.
 - System memory ceiling: GPU reads stop near 82-85 GB/s, the CPU near 71,
   against about 100 GB/s on macOS. Likely a memory performance state that
   nothing on Linux requests.

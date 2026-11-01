@@ -66,6 +66,10 @@ models) routes decode GEMV around the fused descriptor-table kernel:
 | granite-4.0-1b-4bit | 30.0 | 38.4 | 38.4 |
 | Llama-3.2-3B-Instruct-4bit | 11.0 | 12.2 | 13.3 |
 
+Both switches off, against the survey's default routes (before the load
+change below): Qwen2.5-0.5B 60.6 to 79.6, Qwen2.5-1.5B 31.0 to 46.3,
+Llama-3.2-1B 27.4 to 31.6, Qwen2.5-7B 12.1 to 16.5 tok/s.
+
 With fusion off, a sweep of the other decode switches on granite 1B found
 nothing better than 38.4 tok/s: `SDPA_DECODE_SPLIT`, `SDPA_SPLIT_PV`,
 `SDPA_DECODE_BATCH`, `QMV_BATCH`, `ROPE_VECTOR_OFFSET`,
@@ -74,25 +78,58 @@ Two settings are large regressions on this hardware; keep their defaults:
 `MLX_OMARCHY_QMM_VEC_Q4_WORD=0` (4.2 tok/s) and
 `MLX_OMARCHY_SDPA_DECODE_NATIVE=0` (29.7 tok/s).
 
-## Why small GEMVs are latency-bound
+## Device loads now overlap within a thread
 
-A thread issuing four independent 128-bit loads per loop iteration gains only
-1.17x over one load when few threads are resident (4 workgroups: 14.2 vs
-12.1 GB/s), so loads within a thread are effectively serialized. The cause is
-in the Apple9 back end, not in instruction order: selection and the VIR
-optimizer keep the four loads together, but `apple9_schedule_physical`
-(`agx_apple9_ra.c`) retires a pending load as soon as a later instruction
-writes any register the load *read*. After allocation the index register of a
-load is reused immediately by the next address computation, so every load is
-retired (identity bridge with a scoreboard wait) right after it issues.
+A thread issuing four independent 128-bit loads per loop iteration gained only
+1.17x over one load when few threads were resident (4 workgroups: 14.2 vs
+12.1 GB/s), so loads within a thread were serialized. `apple9_schedule_physical`
+(`agx_apple9_ra.c`) retired a pending load as soon as a later instruction
+wrote any register the load *read*. After allocation the index register of a
+load is reused immediately by the next address computation, so every load was
+retired (identity bridge with a scoreboard wait) right after it issued.
 
-Moving loads earlier in NIR, waiting at the first consumer instead of after
-the producer, and skipping `agx_pressure_schedule` were all tried and changed
-nothing measurable (granite decode 38.3-38.5 tok/s either way, so they are not
-merged). The fix is
-either to show the hardware latches a device load's index at issue (then the
-write-after-read check can exempt device-load sources), or to keep each load's
-index register live until the load's first consumer during allocation.
+Apple's own compiler shows the hardware latches the index at issue. Compiling a
+four-load loop with the Xcode Metal toolchain for `applegpu_g16g` gives four
+back-to-back device loads, each writing its result into its own index register
+(`load r5 <- [r5]`, index marked last use). The write-after-read check now
+skips the sources of indexed device loads; result registers stay borrowed until
+completion as before. Indirect (address-pair) loads, atomics, textures and
+scratch keep the conservative rule. `AGX_APPLE9_STRICT_LOAD_HAZARD=1` restores
+the old behaviour for comparison.
+
+Read bandwidth, four 128-bit loads per thread per iteration:
+
+| Workgroups | Before | After | After, `AGX_APPLE9_NO_PRESSURE_SCHED=1` |
+|---:|---:|---:|---:|
+| 4 | 14.3 GB/s | 17.7 GB/s | 36.0 GB/s |
+| 16 | 48.4 GB/s | 58.1 GB/s | 82.1 GB/s |
+
+4-bit GEMV: 2048 x 2048 goes from 40.1 to 45.1 GB/s, 512 x 2048 from 19.3 to
+21.3 GB/s, 8192 x 3072 from 65.1 to 67.9 GB/s.
+
+Decode tok/s with `MLX_OMARCHY_FUSED_GEMV=0 MLX_OMARCHY_FUSED_TRIO=0`, same
+method as the survey:
+
+| Model | Before | After | Change |
+|---|---:|---:|---:|
+| Qwen2.5-0.5B-Instruct-4bit | 79.6 | 86.3 | +8% |
+| Qwen2.5-1.5B-Instruct-4bit | 46.3 | 50.1 | +8% |
+| granite-4.0-1b-4bit | 38.1 | 44.8 | +18% |
+| Llama-3.2-1B-Instruct-4bit | 31.6 | 31.0-32.1 | flat |
+| Llama-3.2-3B-Instruct-4bit | 13.1 | 13.9 | +6% |
+| Qwen2.5-7B-Instruct-4bit | 16.5 | 16.6 | +1% |
+
+Greedy output text (96 tokens) is identical with and without the change on
+granite 1B, Llama 3.2 3B and Qwen2.5 1.5B. All 39 compute and transfer tests
+pass and the kernel logged no GPU faults.
+
+`AGX_APPLE9_NO_PRESSURE_SCHED=1` skips `agx_pressure_schedule`, which places
+loads next to their consumers. It doubles bandwidth with few resident threads
+but lowers GEMV bandwidth (2048 x 2048: 38.3 GB/s) and leaves decode unchanged
+(granite 41.8 tok/s), so it stays an opt-in experiment. A scheduler that keeps
+program order for loads unless that would spill is the likely next step.
+Hoisting loads earlier in NIR and waiting at the first consumer were also tried
+and changed nothing measurable.
 
 ## Kernel
 
@@ -119,9 +156,9 @@ switch for the base M4 until Gravity publishes a qualified build.
 
 - Make the descriptor-table ABI (more than 18 resources) as fast as the
   direct-buffer ABI, or lift the 18-resource direct limit.
-- Reduce the GEMV latency floor on small layers: let device loads overlap
-  within a thread (see "Why small GEMVs are latency-bound"), or split K in the
-  MLX kernels.
+- Reduce the GEMV latency floor on small layers further: a load-aware
+  pressure scheduler (see "Device loads now overlap within a thread"), or
+  split K in the MLX kernels.
 - Cooperative matrix for Apple9, for prefill.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdlib.h>
 #include "compiler/nir/nir.h"
 #include "agx_apple9_ir.h"
 #include "agx_apple9_profile.h"
@@ -835,10 +836,21 @@ apple9_pending_hazard(const struct agx_apple9_vir_instr *ins,
    if (apple9_completion_barrier(ins))
       return true;
    const struct agx_apple9_vir_instr *producer = &p->producer;
+   /* T8132 reads an indexed device load's index GPR at issue: Apple's own
+    * compiler writes the load result into its index register. Only the
+    * result registers stay borrowed until completion. */
+   static int strict = -1;
+   if (strict < 0)
+      strict = getenv("AGX_APPLE9_STRICT_LOAD_HAZARD") != NULL;
+   const bool sources_latched =
+      !strict && producer->op == AGX_APPLE9_VIR_DEVICE_LOAD &&
+      producer->encoding == AGX_APPLE9_ENC_DEVICE_LOAD;
    for (unsigned c = 0; c < ins->dest_components; ++c) {
       unsigned reg = ins->dest + c;
       if (apple9_pending_result(p, reg))
          return true;
+      if (sources_latched)
+         continue;
       /* Includes texture parameter publications, which remain borrowed
        * until the result handoff, and scratch SAVE's destructive input. */
       for (unsigned s = 0; s < producer->nr_srcs; ++s) {
@@ -1044,7 +1056,8 @@ apple9_allocate_candidate(struct agx_apple9_vir_program *program,
       ra.ctx->schedule_delay = apple9_schedule_delay;
    }
    agx_dce(ra.ctx, true);
-   agx_pressure_schedule(ra.ctx);
+   if (!getenv("AGX_APPLE9_NO_PRESSURE_SCHED"))
+      agx_pressure_schedule(ra.ctx);
    agx_ra(ra.ctx);
    if (ra.ctx->scratch_size_B > 4096) {
       *reason =

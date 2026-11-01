@@ -366,6 +366,100 @@ A/B rounds, mean (range):
 Llama 3.2 1B moves between about 29 and 32 tok/s in both settings (it has no
 shuffles either), so that difference is run-to-run variation on the shared GPU.
 
+## Simdgroup matrix multiply-accumulate on G16 (cooperative matrix)
+
+Recovered from the Xcode Metal toolchain (`metal-tt -arch applegpu_g16g`)
+by compiling MSL `simdgroup_float8x8` kernels and diffing the output; no
+hardware dispatch was needed for this table. The probe kernel family:
+
+```metal
+kernel void k(device float *o [[buffer(0)]], device const float *i [[buffer(1)]]) {
+  simdgroup_float8x8 A[MA], B[NB], C[MA][NB];
+  simdgroup_load(A[x], i + 64 * x, 8);                 // every A, B, C fragment
+  simdgroup_load(B[y], i + 64 * (MA + y), 8);          // at a distinct offset
+  simdgroup_load(C[x][y], i + 64 * (64 + x * NB + y), 8);
+  simdgroup_multiply_accumulate(C[x][y], A[x], B[y], C[x][y]);
+  simdgroup_store(C[x][y], o + 64 * (x * NB + y), 8);
+}
+```
+
+for (MA, NB) in {1x1 .. 6x5} gave 123 MACs whose A, B, C and D registers are
+known from the load and store offsets (device-load destination is byte 3 >> 1,
+offset bits 77..92; store data byte 3 >> 1, offset bits 75..90). A bit-by-bit
+solver found a unique instruction bit for every operand register bit. Further
+variants (`simdgroup_multiply`, transposed loads, a runtime stride, chained
+MACs whose results feed each other, half/float mixes) fixed the rest.
+
+### fp32-accumulator form (12 bytes)
+
+`D = A * B + C`, one 8x8x8 tile per SIMD-group, all 32 lanes:
+
+```
+cf 02 54 DD .. .. .. .. .. .. 24 01      template (fp32 A, B, C; accumulate)
+```
+
+| Bits | Field |
+|---|---|
+| 0..7 | `0xcf` opcode |
+| 8..11, 18..23 | constant `0x2`, `0x15` (bits 9, 18, 20, 22 set) |
+| 12..17 | wait mask: bit 12 + k waits on completion slot k + 1 (same as device loads) |
+| 24..30 | D, first register of the result pair (r0..r127) |
+| 32 | D cache hint (set when the next instruction reads D; 0 is always valid) |
+| 41..46, 40 | A register bits 0..5, bit 6 |
+| 47 | A cache hint (value read again soon) |
+| 48 | B cache hint |
+| 49..55 | B register |
+| 57, 56, 59, 58, 61, 60, 63 | C register bits 0..6 (adjacent bit pairs swapped) |
+| 62 | C cache hint |
+| 65..66 | A type: 1 = fp16 (one register, two halves), 2 = fp32 (register pair) |
+| 67..68 | B type, same coding |
+| 69..70 | C/D type: 2 = fp32 |
+| 71, 72, 73 | A, B, C discard: set when this is the operand's last use |
+| 82, 85 | constant (`0x24` in byte 10) |
+| 88 | accumulate: 0 for `simdgroup_multiply` (C field, C discard zero) |
+
+Every sampled operand is (cache 1, discard 0), (cache 0, discard 0) or
+(cache 0, discard 1): cache means "live and reused soon", discard means "dead".
+Operand pairs need not be even-aligned (Apple allocates r7:r8, r9:r10), and D
+may overlap A or C (Apple writes D over C and over A).
+
+The result is not a pending (scoreboarded) value: Apple stores a MAC result
+and feeds it to the next MAC without any wait, so it is interlocked like an
+ordinary ALU result. The MAC itself waits on loads through bits 12..17.
+
+Examples (`metal-tt` output):
+
+| MSL | Bytes | Operands |
+|---|---|---|
+| `c = a*b + c` | `cf 02 56 02 00 04 08 09 d4 43 24 01` | D r2, A r2, B r4, C r6, waits slot 6 |
+| `c = a*b` | `cf 02 56 02 00 04 08 00 d4 41 24 00` | D r2, A r2, B r4, no C |
+| half a, b; float c | `cf 02 56 02 00 10 04 00 ca 43 24 01` | A r8 (f16), B r2 (f16), C r0 |
+| half a; float b, c | `cf 02 56 02 00 0e 00 01 d2 43 24 01` | A r7 (f16), B r0, C r2 |
+| float a, c; half b | `cf 02 56 02 00 04 0c 08 cc 43 24 01` | A r2, B r6 (f16), C r4 |
+| mm5x4 | `cf 12 54 0e 00 1e 7a 82 d4 42 24 01` | D r14, A r15, B r61, C r65, waits slot 1 |
+| mm5x4 | `cf 02 56 3b 00 e6 8d 36 54 42 24 01` | D r59, A r51 (cached), B r70 (cached), C r57 |
+
+The fp16-accumulator form is a different 12-byte layout
+(`cf 00 56 04 02 0a 0c 0e 10 62 8c 00` for half a r5, b r6, c r7, d r2) and is
+not mapped yet.
+
+### Fragment layout
+
+`simdgroup_load`/`simdgroup_store` compile to ordinary per-lane device loads
+and stores; there is no matrix load instruction. A row-major load is one
+64-bit load per lane, so each lane holds two adjacent elements of one row:
+
+```
+row = ((lane >> 4) & 1) * 4 + ((lane >> 1) & 3)
+col = ((lane >> 3) & 1) * 4 + (lane & 1) * 2       // lane holds (row, col), (row, col + 1)
+```
+
+the same layout MLX's `BaseMMAFrag` uses on every Apple GPU and Joshua
+Warren's G13 lowering verified on an M1. fp32 fragments are a register pair
+(element col in the first register); fp16 fragments are the two halves of
+one register. A transposed `simdgroup_load` becomes two scalar loads per lane
+into the same registers, with the MAC unchanged.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's

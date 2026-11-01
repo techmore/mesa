@@ -13,6 +13,7 @@
 #include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "git_sha1.h"
+#include "hk_apple9.h"
 #include "hk_buffer.h"
 #include "hk_entrypoints.h"
 #include "hk_image.h"
@@ -238,6 +239,10 @@ hk_get_device_features(
    struct vk_features *features)
 {
    *features = (struct vk_features){
+      /* VK_KHR_cooperative_matrix (Apple9 compute, opt-in) */
+      .cooperativeMatrix = hk_apple9_coopmat_enabled(dev),
+      .cooperativeMatrixRobustBufferAccess = false,
+
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
       .fullDrawIndexUint32 = true,
@@ -820,6 +825,8 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* Vulkan 1.1 properties */
       .subgroupSize = 32,
+      .cooperativeMatrixSupportedStages =
+         hk_apple9_coopmat_enabled(dev) ? VK_SHADER_STAGE_COMPUTE_BIT : 0,
       .subgroupSupportedStages =
          VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_ALL_GRAPHICS,
       .subgroupSupportedOperations =
@@ -1266,6 +1273,8 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    struct vk_device_extension_table supported_extensions;
    hk_get_device_extensions(instance, &supported_extensions);
+   supported_extensions.KHR_cooperative_matrix =
+      hk_apple9_coopmat_enabled(&pdev->dev);
 
    struct vk_features supported_features;
    hk_get_device_features(&pdev->dev, instance, &supported_extensions,
@@ -1503,6 +1512,35 @@ hk_GetPhysicalDeviceQueueFamilyProperties2(
          }
       }
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+hk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pPropertyCount,
+   VkCooperativeMatrixPropertiesKHR *pProperties)
+{
+   VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties,
+                          pPropertyCount);
+
+   /* One SIMD-group matrix multiply-accumulate per 8x8x8 tile
+    * (agx_nir_lower_apple9_cmat.c). */
+   if (hk_apple9_coopmat_enabled(&pdev->dev)) {
+      vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, p)
+      {
+         p->MSize = 8;
+         p->NSize = 8;
+         p->KSize = 8;
+         p->AType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->BType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->CType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->ResultType = VK_COMPONENT_TYPE_FLOAT32_KHR;
+         p->saturatingAccumulation = VK_FALSE;
+         p->scope = VK_SCOPE_SUBGROUP_KHR;
+      }
+   }
+
+   return vk_outarray_status(&out);
 }
 
 VKAPI_ATTR void VKAPI_CALL

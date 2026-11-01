@@ -6129,6 +6129,42 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
       return true;
    }
    case AGX_APPLE9_VIR_SUBGROUP_BROADCAST: {
+      if (instruction->encoding == AGX_APPLE9_ENC_SUBGROUP_SHUFFLE ||
+          instruction->encoding == AGX_APPLE9_ENC_SUBGROUP_SHUFFLE_IMM) {
+         /* Apple Metal compiler output for applegpu_g16g:
+          *   [op0] [op1] 54 [dest<<1] 03 [src<<2] [F] [B7] [B8] 00
+          * F is the 5-bit immediate << 1 or the operand's low half-register
+          * << 1. B7/B8 select an immediate (2c 02) or register (2e 12)
+          * operand; both forms are the ones Metal uses when the data and
+          * index registers stay live, so no input is consumed. */
+         static const uint8_t ops[4][2] = {
+            [AGX_APPLE9_SHUFFLE_INDEX] = {0x47, 0x04},
+            [AGX_APPLE9_SHUFFLE_XOR] = {0xc7, 0x04},
+            [AGX_APPLE9_SHUFFLE_UP] = {0x47, 0x05},
+            [AGX_APPLE9_SHUFFLE_DOWN] = {0xc7, 0x05},
+         };
+         const bool imm =
+            instruction->encoding == AGX_APPLE9_ENC_SUBGROUP_SHUFFLE_IMM;
+         const unsigned kind =
+            instruction->immediate & AGX_APPLE9_SHUFFLE_KIND_MASK;
+         if (instruction->nr_srcs != (imm ? 1 : 2) ||
+             instruction->dest == AGX_APPLE9_VREG_INVALID ||
+             (instruction->immediate & ~(AGX_APPLE9_SHUFFLE_KIND_MASK |
+                                         (imm ? 0x1f00u : 0u))) ||
+             phys[instruction->dest] >= 64 ||
+             phys[instruction->src[0]] >= 64 ||
+             (!imm && phys[instruction->src[1]] >= 64))
+            return false;
+         const uint8_t field = imm
+            ? AGX_APPLE9_SHUFFLE_IMM_VALUE(instruction->immediate) << 1
+            : phys[instruction->src[1]] << 2;
+         const uint8_t bytes[] = {ops[kind][0], ops[kind][1], 0x54,
+            phys[instruction->dest] << 1, 0x03,
+            phys[instruction->src[0]] << 2, field,
+            imm ? 0x2c : 0x2e, imm ? 0x02 : 0x12, 0};
+         packed_init(packed, bytes, sizeof(bytes));
+         return true;
+      }
       if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_BROADCAST ||
           instruction->nr_srcs != 2 || instruction->immediate ||
           phys[instruction->dest] >= 64 || phys[instruction->src[0]] >= 64 ||

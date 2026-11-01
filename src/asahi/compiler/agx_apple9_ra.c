@@ -177,6 +177,8 @@ apple9_source_width(const struct agx_apple9_vir_instr *ins, unsigned source)
       return 2;
    if (ins->encoding == AGX_APPLE9_ENC_DEVICE_LOAD_INDIRECT && source == 1)
       return 2;
+   if (ins->op == AGX_APPLE9_VIR_SIMD_MATRIX_FMADD && !(source & 1))
+      return 2;
    return 1;
 }
 

@@ -20,6 +20,12 @@ extern "C" {
 
 bool agx_nir_lower_apple9_math(nir_shader *shader);
 
+/* Lower VK_KHR_cooperative_matrix (fp32, 8x8 or 16x16, subgroup scope) onto
+ * nir_intrinsic_simd_matrix_fmadd_agx. Run before variables become SSA, and
+ * only for compute shaders whose workgroup size is a static multiple of 32.
+ * Sets *unsupported for shapes, types or operations it cannot lower. */
+bool agx_nir_lower_apple9_cmat(nir_shader *shader, bool *unsupported);
+
 /* After generic texture lowering, backend1 holds a packed Apple9 LOD/bias
  * word rather than the original floating-point LOD or integer fetch level. */
 bool agx_nir_lower_apple9_texture_lod(nir_shader *shader);

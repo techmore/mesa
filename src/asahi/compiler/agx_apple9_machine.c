@@ -1863,6 +1863,36 @@ static const struct agx_apple9_encoding_info encodings[] = {
                           95, 2, AGX_APPLE9_OPERAND_ALLOCATABLE,
                           AGX_APPLE9_EVIDENCE_BYTE_DIFF)},
       },
+   /* 12-byte fp32-accumulator SIMD-group matrix multiply-accumulate, from
+    * metal-tt applegpu_g16g output (README.apple9-honeykrisp.md). Every
+    * operand is a register pair with a seven-bit first-register field; pairs
+    * need not be even. The six sources are the pairs' low and high words. */
+   [AGX_APPLE9_ENC_SIMD_MATRIX_FMADD] =
+      {
+         .name = "simd_matrix_fmadd32",
+         .length = 12,
+         .operand_count = 7,
+         .allocator_safe = true,
+         .evidence = AGX_APPLE9_EVIDENCE_BYTE_DIFF,
+         .operands = {
+            GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_32, 94, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 94, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
+                AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32, 95, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC2, AGX_APPLE9_WIDTH_32, 94, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC3, AGX_APPLE9_WIDTH_32, 95, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC4, AGX_APPLE9_WIDTH_32, 94, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_SCATTERED,
+                AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+            GPR(AGX_APPLE9_OPERAND_SRC5, AGX_APPLE9_WIDTH_32, 95, 2,
+                AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_BYTE_DIFF),
+         },
+      },
    [AGX_APPLE9_ENC_TILE_LOAD_COORDS] =
       {
          .name = "tile_load_coords",

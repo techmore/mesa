@@ -3,7 +3,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "compiler/nir/nir.h"
 #include "agx_apple9_ir.h"
 #include "agx_apple9_profile.h"
@@ -1204,6 +1206,20 @@ apple9_allocation_cost(const struct agx_apple9_vir_program *p)
    return cost;
 }
 
+static void
+apple9_debug_cost(const char *name, struct apple9_allocation_cost c)
+{
+   static int debug = -1;
+   if (debug < 0)
+      debug = getenv("AGX_APPLE9_SCHED_DEBUG") != NULL;
+   if (debug)
+      fprintf(stderr,
+              "APPLE9_SCHED %-9s spills=%llu ins=%llu bytes=%llu regs=%u gaps=%llu copies=%d\n",
+              name, (unsigned long long)c.spills,
+              (unsigned long long)c.instructions, (unsigned long long)c.bytes,
+              c.registers, (unsigned long long)c.dependency_gaps, c.has_copies);
+}
+
 static bool
 apple9_allocation_cheaper(struct apple9_allocation_cost a,
                           struct apple9_allocation_cost b)
@@ -1228,6 +1244,8 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
       return false;
 
    struct apple9_allocation_cost cost = apple9_allocation_cost(&best);
+   const char *force = getenv("AGX_APPLE9_SCHED_FORCE");
+   apple9_debug_cost("plain", cost);
    if (cost.has_copies || cost.spills) {
       /* Bank hints can conflict with later tuples and phi reconciliation.
        * Compare completed allocations so those costs are paid by the policy
@@ -1247,9 +1265,19 @@ agx_apple9_allocate_shared(struct agx_apple9_vir_program *program,
       for (unsigned banks = 0; banks < 2; ++banks) {
          agx_apple9_vir_init(&alternative);
          const char *unused_reason = NULL;
-         if (apple9_allocate_candidate(program, nir, banks, true, &alternative,
-                                        &unused_reason) &&
-             apple9_allocation_cheaper(apple9_allocation_cost(&alternative), cost)) {
+         bool ok = apple9_allocate_candidate(program, nir, banks, true,
+                                             &alternative, &unused_reason);
+         if (ok)
+            apple9_debug_cost(banks ? "latency-b" : "latency",
+                              apple9_allocation_cost(&alternative));
+         if (ok && force && !strcmp(force, "plain"))
+            ok = false;
+         else if (ok && force && !strcmp(force, "latency"))
+            ok = !banks || apple9_allocation_cheaper(
+                              apple9_allocation_cost(&alternative), cost);
+         else if (ok)
+            ok = apple9_allocation_cheaper(apple9_allocation_cost(&alternative), cost);
+         if (ok) {
             SWAP(best, alternative);
             cost = apple9_allocation_cost(&best);
          }

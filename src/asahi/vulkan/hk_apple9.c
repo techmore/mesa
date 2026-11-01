@@ -416,6 +416,26 @@ apple9_emit_launch(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
    cs->current = (uint8_t *)cs->current + size;
    cs->stats.cmds++;
    cs->stats.calls++;
+
+   /* Profiling aid: HK_APPLE9_DUP=all, or a class key
+    * "preamble_offset/local_x/resources/threadgroup_bytes", launches matching
+    * work twice. The added time per token over the class's launch count is
+    * that class's GPU cost. Results are wrong while it is set. */
+   static const char *dup = (const char *)-1;
+   if (dup == (const char *)-1)
+      dup = getenv("HK_APPLE9_DUP");
+   if (dup) {
+      char key[64];
+      snprintf(key, sizeof(key), "%u/%u/%u/%u", profile->preamble_offset,
+               local[0], count, profile->required_threadgroup_memory_bytes);
+      if (!strcmp(dup, "all") || !strcmp(dup, key)) {
+         uint8_t record[64];
+         memcpy(record, (uint8_t *)cs->current - size, size);
+         hk_ensure_cs_has_space(cmd, cs, size + 64);
+         memcpy(cs->current, record, size);
+         cs->current = (uint8_t *)cs->current + size;
+      }
+   }
    return true;
 }
 

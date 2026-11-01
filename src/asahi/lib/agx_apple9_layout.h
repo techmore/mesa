@@ -21,10 +21,14 @@
 static inline unsigned
 agx_apple9_max_shared_bytes(void)
 {
+   static unsigned cached;
+   if (cached)
+      return cached;
    const char *env = getenv("AGX_APPLE9_MAX_SHARED");
    unsigned value = env ? (unsigned)strtoul(env, NULL, 0) : 0;
    if (value < 1024 || value > 32768 || (value & (value - 1)))
-      return 1024;
+      value = 1024;
+   cached = value;
    return value;
 }
 

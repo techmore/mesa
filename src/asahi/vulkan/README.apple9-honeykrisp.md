@@ -460,6 +460,57 @@ Warren's G13 lowering verified on an M1. fp32 fragments are a register pair
 one register. A transposed `simdgroup_load` becomes two scalar loads per lane
 into the same registers, with the MAC unchanged.
 
+### VK_KHR_cooperative_matrix on Apple9 (opt-in)
+
+`HK_APPLE9_COOPMAT=1` makes Apple9 compute advertise `VK_KHR_cooperative_matrix`
+with one shape: fp32 8x8x8, subgroup scope. `agx_nir_lower_apple9_cmat`
+(after Joshua Warren's G13 lowering) turns each matrix into the lane's two
+fragment elements, loads and stores into ordinary per-lane accesses (the
+backend pairs adjacent words into 64-bit loads), and each 8x8x8 step into
+one `SIMD_MATRIX_FMADD` virtual op packed as the instruction above. fp16 A
+or B operands widen to fp32 first (omarchy-mlx's f16 kernel multiplies an
+fp16 activation tile by fp32 weights); 16x16 matrices tile into 8x8 blocks.
+Both work but are not advertised. Only compute shaders whose workgroup size
+is a static multiple of 32 are lowered, since the instruction uses every
+lane; other cooperative-matrix shaders fail to compile.
+
+Pending loads that feed the instruction are retired with explicit waits;
+it does not yet fold them into its own wait mask.
+
+Results on the M4, no GPU faults in any run:
+
+- A Vulkan GEMM with one 8x8 tile per subgroup (`vkcmat`, integer-valued
+  data so every sum is exact) matches the CPU bit for bit from 8x8x8 to
+  1024x1024x1024, including 72x40x24, fp16 A, and 16x16 tiles. At
+  1024x1024x1024 it runs at 640-760 GFLOP/s.
+- All 35 compute tests pass with and without the variable.
+- MLX 4-bit matmul (`qmm_bench.py`, 8192 x 3072, interleaved A/B, two
+  rounds each, identical within 0.5%):
+
+  | Activations, rows | FMA route | Cooperative matrix |
+  |---|---:|---:|
+  | bf16, 64 | 809 GFLOP/s | 1375 GFLOP/s |
+  | bf16, 512 | 889 | 1631 |
+  | f16, 64 | 784 | 1284 |
+  | f16, 512 | 855 | 1396 |
+
+  GPU results match MLX's CPU path within bf16/f16 rounding on six shapes
+  from 2 x 512 x 512 to 512 x 2048 x 2048.
+- Prefill, 512 tokens (`prefill_bench.py`, best of three):
+
+  | Model | FMA route | Cooperative matrix |
+  |---|---:|---:|
+  | Llama-3.2-1B-Instruct-4bit | 307.5 tok/s | 475.0 tok/s |
+  | granite-4.0-1b-4bit (bf16) | 168.8 | 355.1 |
+  | Qwen2.5-1.5B-Instruct-4bit | 246.5 | 380.1 |
+  | Mistral-7B-Instruct-v0.3-4bit | 56.9 | 91.2 |
+  | Qwen3.5-2B-MLX-4bit | 45.5 | 50.3 |
+
+  Greedy output (48 tokens after a 400-token prompt) is identical with and
+  without the variable on Llama 3.2 1B, granite 1B, Qwen2.5 1.5B and
+  Mistral 7B. Decode is unchanged (Llama 1B 23.6 vs 25.7, granite 33.4 vs
+  32.9 tok/s, other agents sharing the GPU).
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -497,4 +548,13 @@ switch for the base M4 until Gravity publishes a qualified build.
   would come from the Xcode Metal toolchain as the subgroup ones did.
 - Per-lane shuffle operands still use the broadcast fallback; Metal's
   four-shuffle expansion of `simd_shuffle` is not decoded yet.
+
+- Cooperative matrix: fold load waits into the instruction's wait mask,
+  map the fp16-accumulator form, advertise fp16 and 16x16 shapes once
+  tested more widely, test column-major loads and stores, and turn
+  `HK_APPLE9_COOPMAT` on by default.
+- Shuffles still use the broadcast fallback. Apple's Metal compiler output
+  for applegpu_g16g shows xor/up/down with immediate offsets as single
+  instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not
+  yet wired in.
 - Apple9 pipelines are not stored in the pipeline cache.

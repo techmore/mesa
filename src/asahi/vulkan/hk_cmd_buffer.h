@@ -512,6 +512,10 @@ struct hk_cmd_buffer {
 
    /* Owned large BOs */
    struct util_dynarray large_bos;
+
+   /* Apple9 launch/resource records, in the low USC aperture */
+   struct agx_pool apple9_pool;
+   bool apple9_pool_valid;
 };
 
 VK_DEFINE_HANDLE_CASTS(hk_cmd_buffer, vk.base, VkCommandBuffer,

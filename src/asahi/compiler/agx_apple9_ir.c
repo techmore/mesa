@@ -6090,9 +6090,36 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    }
    case AGX_APPLE9_VIR_SUBGROUP_SCAN_IADD: {
       if (instruction->encoding != AGX_APPLE9_ENC_SUBGROUP_SCAN_IADD ||
-          instruction->nr_srcs != 1 || instruction->immediate ||
+          instruction->nr_srcs != 1 ||
+          instruction->immediate >= AGX_APPLE9_SUBGROUP_FORM_COUNT ||
           phys[instruction->dest] >= 64 || phys[instruction->src[0]] >= 64)
          return false;
+      if (instruction->immediate != AGX_APPLE9_SUBGROUP_SCAN_EXCL_IADD) {
+         /* Apple Metal compiler output for applegpu_g16g: operation bytes,
+          * 32-bit destination (0x56), and type/scan tail bytes. */
+         static const uint8_t forms[AGX_APPLE9_SUBGROUP_FORM_COUNT][4] = {
+            [AGX_APPLE9_SUBGROUP_REDUCE_IADD] = {0xbf, 0x01, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_REDUCE_FADD] = {0x3f, 0x06, 0x16, 0x02},
+            [AGX_APPLE9_SUBGROUP_REDUCE_FMUL] = {0xbf, 0x06, 0x16, 0x02},
+            [AGX_APPLE9_SUBGROUP_REDUCE_UMIN] = {0x3f, 0x03, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_REDUCE_UMAX] = {0xbf, 0x03, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_REDUCE_IMIN] = {0x3f, 0x02, 0x16, 0x05},
+            [AGX_APPLE9_SUBGROUP_REDUCE_IMAX] = {0xbf, 0x02, 0x16, 0x05},
+            [AGX_APPLE9_SUBGROUP_REDUCE_FMIN] = {0xbf, 0x05, 0x0a, 0x02},
+            [AGX_APPLE9_SUBGROUP_REDUCE_FMAX] = {0xbf, 0x07, 0x0a, 0x02},
+            [AGX_APPLE9_SUBGROUP_REDUCE_IAND] = {0x3f, 0x00, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_REDUCE_IOR] = {0xbf, 0x00, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_REDUCE_IXOR] = {0x3f, 0x01, 0x16, 0x01},
+            [AGX_APPLE9_SUBGROUP_SCAN_EXCL_FADD] = {0x3f, 0x06, 0x16, 0x22},
+            [AGX_APPLE9_SUBGROUP_SCAN_EXCL_FMUL] = {0xbf, 0x06, 0x16, 0x22},
+         };
+         const uint8_t *f = forms[instruction->immediate];
+         const uint8_t bytes[] = {f[0], f[1], 0x56,
+            phys[instruction->dest] << 1, 0x03,
+            phys[instruction->src[0]] << 2, f[2], f[3]};
+         packed_init(packed, bytes, sizeof(bytes));
+         return true;
+      }
       /* Authored integer scans use an exclusive primitive. Retain the input
        * so inclusive scans can add it and later SSA uses remain valid. */
       const uint8_t bytes[] = {0xbf, 0x01, 0x54,

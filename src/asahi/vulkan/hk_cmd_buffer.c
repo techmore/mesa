@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_cmd_buffer.h"
+#include "hk_apple9.h"
 
 #include "agx_abi.h"
 #include "agx_bo.h"
@@ -69,6 +70,11 @@ hk_free_resettable_cmd_buffer(struct hk_cmd_buffer *cmd)
    }
 
    util_dynarray_clear(&cmd->large_bos);
+
+   if (cmd->apple9_pool_valid) {
+      agx_pool_cleanup(&cmd->apple9_pool);
+      cmd->apple9_pool_valid = false;
+   }
 }
 
 static void
@@ -767,6 +773,12 @@ hk_dispatch_precomp(struct hk_cmd_buffer *cmd, struct agx_grid grid,
    struct hk_cs *cs = hk_cmd_buffer_get_cs_general(cmd, target, true);
    if (!cs)
       return;
+
+   if (prog->apple9) {
+      uint64_t args = hk_pool_upload(cmd, data, data_size, 16);
+      hk_apple9_dispatch_precomp(cmd, cs, prog, &grid, args);
+      return;
+   }
 
    struct agx_ptr t = hk_pool_usc_alloc(cmd, agx_usc_size(15), 64);
    uint64_t uploaded_data = hk_pool_upload(cmd, data, data_size, 4);

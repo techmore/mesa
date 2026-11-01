@@ -13,4 +13,19 @@
 #define AGX_APPLE9_ENTRY_ALIGNMENT   0x00000040u
 #define AGX_APPLE9_ENTRY_MAX_OFFSET  ((0xffffffu - 0x2au) / 2u)
 
+
+#include <stdlib.h>
+
+/* Threadgroup memory validated on T8132: 128..1024 bytes. Larger sizes are
+ * opt-in for hardware bring-up through AGX_APPLE9_MAX_SHARED. */
+static inline unsigned
+agx_apple9_max_shared_bytes(void)
+{
+   const char *env = getenv("AGX_APPLE9_MAX_SHARED");
+   unsigned value = env ? (unsigned)strtoul(env, NULL, 0) : 0;
+   if (value < 1024 || value > 32768 || (value & (value - 1)))
+      return 1024;
+   return value;
+}
+
 #endif

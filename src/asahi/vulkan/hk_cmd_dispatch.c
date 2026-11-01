@@ -45,6 +45,9 @@ void
 hk_cdm_cache_flush(struct hk_device *dev, struct hk_cs *cs)
 {
    assert(cs->type == HK_CS_CDM);
+   if (hk_apple9_compute_enabled(&dev->dev))
+      return;
+
    assert(cs->current + AGX_CDM_BARRIER_LENGTH < cs->end &&
           "caller must ensure space");
 
@@ -58,6 +61,11 @@ hk_dispatch_with_usc_launch(struct hk_device *dev, struct hk_cs *cs,
                             uint32_t usc, struct agx_grid grid,
                             struct agx_workgroup wg)
 {
+   if (hk_apple9_compute_enabled(&dev->dev)) {
+      fprintf(stderr, "hk/apple9: dropped a legacy compute launch\n");
+      return;
+   }
+
    hk_ensure_cs_has_space(cs->cmd, cs, 0x2000 /* TODO */);
    cs->stats.cmds++;
 
@@ -88,6 +96,11 @@ static void
 dispatch(struct hk_cmd_buffer *cmd, struct agx_grid grid)
 {
    struct hk_shader *s = hk_only_variant(cmd->state.cs.shader);
+   if (s->apple9.enabled) {
+      hk_apple9_dispatch(cmd, s, &grid);
+      return;
+   }
+
    if (agx_is_shader_empty(&s->b))
       return;
 

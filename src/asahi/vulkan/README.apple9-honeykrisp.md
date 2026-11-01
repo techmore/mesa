@@ -179,6 +179,46 @@ about 95 GPRs the allocator rematerializes or spills. Extra registers are
 not free on the M4, which supports keeping registers ahead of dependency gaps
 in the selection order.
 
+## Prefill: guarded loads become selects
+
+Without cooperative matrix, omarchy-mlx runs f16 prefill through a scalar-FMA
+kernel (`qmm_fma.comp`) and bf16 prefill through a shared-memory tile kernel
+(`qmm_tile.comp`). The FMA kernel guards every load with a bounds check
+(`row < m ? x[...] : 0`). On older Apple GPUs Honeykrisp marks loads
+speculatable when the kernel enables soft faults, and NIR turns those guards
+into selects. The M4 kernel reports no soft faults (`features=0x2`), so on
+Apple9 each guard stayed a branch, and the allocator reconciled all 32
+accumulators at every join: 5300 of the kernel's 6412 instructions were
+register copies.
+
+Apple9 now rewrites a load in a one-block arm to read element 0 of the same
+binding when its arm is not taken, and lets peephole select flatten the
+branch. That address is always mapped: null bindings resolve to the device's
+read-only zero page instead of address 0. `CAN_REORDER` is granted only while
+peephole select runs, so later passes cannot move these loads across stores to
+an aliased binding. `AGX_APPLE9_NO_GUARDED_LOAD_SELECT=1` restores the branches.
+
+The FMA kernel drops to 1977 instructions (901 copies). 4-bit matmul, 64 rows
+x 8192 x 3072, goes from 174 to 778 GFLOP/s (the same kernel reaches 545 on an
+M1 with soft faults). Prefill tok/s:
+
+| Model (f16 activations) | Prompt | Before | After |
+|---|---:|---:|---:|
+| Llama-3.2-1B-Instruct-4bit | 44 | 40.3 | 163.1 |
+| Llama-3.2-1B-Instruct-4bit | 512 | 67.4 | 309.7 |
+| Qwen2.5-1.5B-Instruct-4bit | 44 | 29.0 | 132.5 |
+| Qwen2.5-1.5B-Instruct-4bit | 512 | 53.8 | 249.2 |
+| Mistral-7B-Instruct-v0.3-4bit | 44 | 7.1 | 33.1 |
+| Mistral-7B-Instruct-v0.3-4bit | 512 | 12.0 | 57.0 |
+| granite-4.0-1b-4bit (bf16) | 512 | 19.5 | 19.5 |
+
+Greedy output text is identical before and after on all four models, decode
+speed is unchanged, GPU results match the CPU within rounding on edge shapes
+(m = 77, n = 1000; m = 130, n = 2050), and all 39 tests pass. Most
+mlx-community 4-bit models use f16; bf16 models such as granite still take
+the tile kernel at about 66 GFLOP/s. The null-binding redirect is not covered
+by a hardware test yet: MLX never binds null descriptors.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's

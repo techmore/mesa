@@ -4258,6 +4258,121 @@ apple9_lower_half_conversion(nir_builder *b, nir_alu_instr *alu, void *data)
    return true;
 }
 
+
+/* Without soft fault a buffer load guarded by a condition cannot move above
+ * its branch. Point the load at element 0 of the same binding when its arm is
+ * not taken: that address is always mapped (null bindings resolve to the zero
+ * page), the value is discarded by the select, and peephole select can then
+ * flatten the branch instead of leaving joins for the allocator to repair. */
+static bool
+apple9_guarded_load_arm_ok(nir_block *block)
+{
+   unsigned count = 0;
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_ssbo &&
+             intr->intrinsic != nir_intrinsic_load_ubo)
+            return false;
+         if (nir_intrinsic_access(intr) & (ACCESS_VOLATILE | ACCESS_COHERENT))
+            return false;
+         break;
+      }
+      default:
+         return false;
+      }
+      if (++count > 64)
+         return false;
+   }
+   return true;
+}
+
+/* Redirect an arm's loads once (they keep CAN_SPECULATE afterwards). NIR's
+ * legality check also wants CAN_REORDER; grant it only while peephole select
+ * runs, and record the loads so it can be withdrawn: a lasting CAN_REORDER
+ * would let CSE or code motion cross stores to an aliased binding. */
+static bool
+apple9_redirect_arm_loads(nir_block *block, nir_def *cond, bool taken_if_true,
+                          struct util_dynarray *reorder)
+{
+   bool progress = false;
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic != nir_intrinsic_load_ssbo &&
+          intr->intrinsic != nir_intrinsic_load_ubo)
+         continue;
+      if (!(nir_intrinsic_access(intr) & ACCESS_CAN_SPECULATE)) {
+         nir_builder b = nir_builder_at(nir_before_instr(instr));
+         nir_def *offset = intr->src[1].ssa;
+         nir_def *zero = nir_imm_intN_t(&b, 0, offset->bit_size);
+         nir_def *safe = taken_if_true ? nir_bcsel(&b, cond, offset, zero)
+                                       : nir_bcsel(&b, cond, zero, offset);
+         nir_src_rewrite(&intr->src[1], safe);
+         nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) |
+                                           ACCESS_CAN_SPECULATE);
+         progress = true;
+      }
+      if (!(nir_intrinsic_access(intr) & ACCESS_CAN_REORDER)) {
+         nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) |
+                                           ACCESS_CAN_REORDER);
+         util_dynarray_append(reorder, intr);
+      }
+   }
+   return progress;
+}
+
+static bool
+apple9_speculate_guarded_loads(nir_shader *nir,
+                               const nir_opt_peephole_select_options *options)
+{
+   static int disabled = -1;
+   if (disabled < 0)
+      disabled = getenv("AGX_APPLE9_NO_GUARDED_LOAD_SELECT") != NULL;
+   if (disabled)
+      return false;
+   bool progress = false;
+   struct util_dynarray reorder;
+   util_dynarray_init(&reorder, NULL);
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         nir_cf_node *next = nir_cf_node_next(&block->cf_node);
+         if (!next || next->type != nir_cf_node_if)
+            continue;
+         nir_if *nif = nir_cf_node_as_if(next);
+         nir_block *then_block = nir_if_first_then_block(nif);
+         nir_block *else_block = nir_if_first_else_block(nif);
+         if (then_block != nir_if_last_then_block(nif) ||
+             else_block != nir_if_last_else_block(nif) ||
+             !apple9_guarded_load_arm_ok(then_block) ||
+             !apple9_guarded_load_arm_ok(else_block))
+            continue;
+         nir_def *cond = nif->condition.ssa;
+         impl_progress |=
+            apple9_redirect_arm_loads(then_block, cond, true, &reorder);
+         impl_progress |=
+            apple9_redirect_arm_loads(else_block, cond, false, &reorder);
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   if (util_dynarray_num_elements(&reorder, nir_intrinsic_instr *)) {
+      progress |= nir_opt_peephole_select(nir, options);
+      util_dynarray_foreach(&reorder, nir_intrinsic_instr *, intr) {
+         nir_intrinsic_set_access(*intr, nir_intrinsic_access(*intr) &
+                                            ~ACCESS_CAN_REORDER);
+      }
+   }
+   util_dynarray_fini(&reorder);
+   return progress;
+}
+
 static void
 apple9_legalize_buffer_accesses(nir_shader *nir)
 {
@@ -4342,9 +4457,13 @@ apple9_prepare_dag(nir_shader *nir)
    const nir_opt_peephole_select_options select_options = {
       .limit = 64,
       .expensive_alu_ok = true,
+      /* Only loads marked speculatable pass NIR's legality check; on Apple9
+       * those are the redirected guarded loads below. */
+      .indirect_load_ok = true,
    };
    do {
-      progress = nir_opt_peephole_select(nir, &select_options);
+      progress = apple9_speculate_guarded_loads(nir, &select_options);
+      progress |= nir_opt_peephole_select(nir, &select_options);
       progress |= nir_opt_copy_prop(nir);
       progress |= nir_opt_remove_phis(nir);
       progress |= nir_opt_dead_cf(nir);

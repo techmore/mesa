@@ -180,6 +180,30 @@ static const struct agx_apple9_encoding_info encodings[] = {
              AGX_APPLE9_OPERAND_ALLOCATABLE | AGX_APPLE9_OPERAND_CLOBBER, AGX_APPLE9_EVIDENCE_HARDWARE),
       },
    },
+   /* Shuffles keep both inputs (retaining operand hints), unlike the
+    * broadcast form above. */
+   [AGX_APPLE9_ENC_SUBGROUP_SHUFFLE] = {
+      .name = "subgroup_shuffle", .length = 10, .operand_count = 3,
+      .allocator_safe = true, .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
+      .operands = {
+         GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_32, 63, 2,
+             AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
+         GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 63, 2,
+             AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
+         GPR(AGX_APPLE9_OPERAND_SRC1, AGX_APPLE9_WIDTH_32, 63, 2,
+             AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
+      },
+   },
+   [AGX_APPLE9_ENC_SUBGROUP_SHUFFLE_IMM] = {
+      .name = "subgroup_shuffle_imm", .length = 10, .operand_count = 2,
+      .allocator_safe = true, .evidence = AGX_APPLE9_EVIDENCE_HARDWARE,
+      .operands = {
+         GPR(AGX_APPLE9_OPERAND_DEST, AGX_APPLE9_WIDTH_32, 63, 2,
+             AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
+         GPR(AGX_APPLE9_OPERAND_SRC0, AGX_APPLE9_WIDTH_32, 63, 2,
+             AGX_APPLE9_OPERAND_ALLOCATABLE, AGX_APPLE9_EVIDENCE_HARDWARE),
+      },
+   },
    [AGX_APPLE9_ENC_SUBGROUP_BALLOT] = {
       .name = "subgroup_ballot", .length = 10, .operand_count = 2,
       .allocator_safe = true, .evidence = AGX_APPLE9_EVIDENCE_BYTE_DIFF,

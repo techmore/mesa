@@ -306,6 +306,66 @@ settings, old default (fused) to new default:
 Greedy text is unchanged on six of the seven; Qwen2.5 1.5B takes a different,
 equally coherent wording from word 41, from the two routes' accumulation order.
 
+## Native subgroup shuffles
+
+`subgroupShuffleXor/Up/Down` and `subgroupShuffle` are now single
+instructions when the lane, offset or mask is a constant or subgroup-uniform
+(NIR divergence analysis). Encodings, from `metal-tt -arch applegpu_g16g`
+builds varying registers, offsets and liveness:
+
+    [op0] [op1] 54 [dest<<1] 03 [src<<2] [F] [B7] [B8] 00
+
+| op0 op1 | Relation |
+|---|---|
+| `47 04` | index (`simd_shuffle` / `simd_broadcast`) |
+| `c7 04` | xor |
+| `47 05` | up |
+| `c7 05` | down |
+
+F is the operand: an immediate << 1 (`2c 02` in B7/B8) or the low
+half-register << 1 of a GPR (`2e 12`). B8 bit 1 / bit 2 is Metal's keep /
+last-use hint for the data register; for the operand, B7 bit 1 with B8 bit 4
+is a retained GPR and B8 bits 3 and 4 a last-use GPR (the existing
+broadcast's `2c 1c`, hence its clobbering inputs); bit 3 alone appears with
+a uniform-register operand. Byte 1 bits 4-7 and byte 2 bits 0-1 are the
+usual wait mask; 16-bit data uses B7 = `20`. The backend always emits the retaining forms, so no input is consumed;
+narrow and boolean values shuffle as 32-bit lanes, 64-bit as two halves.
+
+The register operand is not per lane. Probes with per-quad operands fit one
+model exactly: each quad reads the operand from one of its active lanes, the
+destination quad's value picks the source quad and the source quad's value
+picks the position inside it (`sh_quad_mix` reproduces the predicted wrong
+answer). Metal emits xor/up/down as one instruction but expands
+`simd_shuffle` into four shuffles and selects; here per-lane operands keep
+the broadcast fallback. Uniform operands are exact in divergent
+control flow even when the inactive lanes' registers hold other values.
+In the probes, source lanes past the subgroup end or inactive read as 0.
+`AGX_APPLE9_NO_NATIVE_SHUFFLE=1` restores the fallback;
+`AGX_APPLE9_NATIVE_SHUFFLE_DIVERGENT=1` forces the single instruction for
+hardware probes only (wrong for per-lane operands).
+
+A shuffle was 32 broadcasts and selects: `subgroupShuffleXor(v, 1)` compiles
+to 9 instructions instead of 199, a five-step xor butterfly to 16 instead of
+848. 45 new compute cases (xor/up/down by 1, 2, 4, 8, 16; f32, f16, u16, bool,
+u64, uvec2; constant, push-constant and UBO operands; variable index,
+out-of-range lanes, divergent control flow, loops) pass natively and with the
+opt-out, as do the 35 existing tests; no kernel messages.
+
+The decode paths of the 4-bit models below contain no shuffles (`qmm_vec`
+avoids them; shuffles are in `matmul_vec`, the bf16 GEMV, the gated-delta
+kernels and coopmat flash attention), so decode is unchanged within noise and
+greedy text is identical. Decode tok/s, `llm_survey.py 32`, three interleaved
+A/B rounds, mean (range):
+
+| Model | Native (runs) | `AGX_APPLE9_NO_NATIVE_SHUFFLE=1` (runs) |
+|---|---:|---:|
+| granite-4.0-1b-4bit | 45.8 (45.8-45.9) | 45.8 (45.8-45.8) |
+| Qwen2.5-1.5B-Instruct-4bit | 50.2 (50.2-50.3) | 50.2 (50.2-50.2) |
+| Llama-3.2-1B-Instruct-4bit | 30.9 (28.9-32.0) | 29.7 (28.7-31.5) |
+
+Llama 3.2 1B moves between about 29 and 32 tok/s in both settings (it has no
+shuffles either), so that difference is run-to-run variation on the shared GPU.
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -341,8 +401,6 @@ switch for the base M4 until Gravity publishes a qualified build.
   `asahi/hwmat-vec2-on` and `agent/hk-bf16-cmat`) gets about 2x over the FMA
   kernel on an M1 from simdgroup matrix instructions; the Apple9 encodings
   would come from the Xcode Metal toolchain as the subgroup ones did.
-- Shuffles still use the broadcast fallback. Apple's Metal compiler output
-  for applegpu_g16g shows xor/up/down with immediate offsets as single
-  instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not
-  yet wired in.
+- Per-lane shuffle operands still use the broadcast fallback; Metal's
+  four-shuffle expansion of `simd_shuffle` is not decoded yet.
 - Apple9 pipelines are not stored in the pipeline cache.

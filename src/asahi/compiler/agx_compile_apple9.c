@@ -785,6 +785,10 @@ apple9_instruction_is_in_subset(nir_instr *instr, bool graphics)
              op == nir_intrinsic_exclusive_scan ||
              op == nir_intrinsic_reduce ||
              op == nir_intrinsic_read_invocation ||
+             op == nir_intrinsic_shuffle ||
+             op == nir_intrinsic_shuffle_xor ||
+             op == nir_intrinsic_shuffle_up ||
+             op == nir_intrinsic_shuffle_down ||
              op == nir_intrinsic_ballot ||
              op == nir_intrinsic_load_scratch ||
              op == nir_intrinsic_store_scratch ||
@@ -885,6 +889,19 @@ apple9_current_load_flags(struct apple9_dag_lower *lower)
                       : 0;
 
    return flags;
+}
+
+/* Native Apple9 shuffle relation for a NIR shuffle intrinsic, or -1. */
+static int
+apple9_shuffle_kind(nir_intrinsic_op op)
+{
+   switch (op) {
+   case nir_intrinsic_shuffle: return AGX_APPLE9_SHUFFLE_INDEX;
+   case nir_intrinsic_shuffle_xor: return AGX_APPLE9_SHUFFLE_XOR;
+   case nir_intrinsic_shuffle_up: return AGX_APPLE9_SHUFFLE_UP;
+   case nir_intrinsic_shuffle_down: return AGX_APPLE9_SHUFFLE_DOWN;
+   default: return -1;
+   }
 }
 
 /* Native Apple9 subgroup form for a 32-bit scalar reduction or scan, or -1. */
@@ -1876,6 +1893,28 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             uint32_t add[] = {value, source};
             value = apple9_dag_emit(lower, AGX_APPLE9_VIR_IADD,
                AGX_APPLE9_ENC_INT_ADD_EXTENDED, add, 2, 0);
+         }
+      } else if (intr && apple9_shuffle_kind(intr->intrinsic) >= 0) {
+         /* Native shuffle; the NIR lowering only leaves 32-bit scalars. */
+         if (scalar.def->bit_size != 32)
+            return AGX_APPLE9_VREG_INVALID;
+         const unsigned kind = apple9_shuffle_kind(intr->intrinsic);
+         uint32_t sources[] = {
+            apple9_lower_dag_scalar(lower,
+               nir_get_scalar(intr->src[0].ssa, scalar.comp)),
+            AGX_APPLE9_VREG_INVALID,
+         };
+         nir_scalar operand = nir_get_scalar(intr->src[1].ssa, 0);
+         if (nir_scalar_is_const(operand) &&
+             nir_scalar_as_uint(operand) < 32) {
+            value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SUBGROUP_BROADCAST,
+               AGX_APPLE9_ENC_SUBGROUP_SHUFFLE_IMM, sources, 1,
+               AGX_APPLE9_SHUFFLE_IMM(kind,
+                                      (uint32_t)nir_scalar_as_uint(operand)));
+         } else {
+            sources[1] = apple9_lower_dag_scalar(lower, operand);
+            value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SUBGROUP_BROADCAST,
+               AGX_APPLE9_ENC_SUBGROUP_SHUFFLE, sources, 2, kind);
          }
       } else if (intr && intr->intrinsic == nir_intrinsic_read_invocation) {
          if (scalar.def->bit_size != 32)
@@ -5373,10 +5412,13 @@ apple9_lower_compute_subgroups(nir_builder *b, nir_intrinsic_instr *intr,
 static void apple9_lower_textures(nir_shader *nir);
 
 /* Subgroup operations without a native Apple9 encoding. Native today: ballot,
- * broadcast (read_invocation) and 32-bit integer-add scans. Everything else is
- * rebuilt from 32 straight-line broadcasts, one per lane, combined with
- * selects. Apple9 structured control flow cannot express the waterfall loops
- * of the common lowering, so no loops are introduced. Correct, not fast. */
+ * broadcast (read_invocation), reductions and scans (see
+ * apple9_native_subgroup) and shuffles whose lane/offset/mask operand is
+ * constant or uniform (apple9_shuffle_operand_uniform;
+ * AGX_APPLE9_NO_NATIVE_SHUFFLE=1 opts out). Everything else is rebuilt
+ * from 32 straight-line broadcasts, one per lane, combined with selects.
+ * Apple9 structured control flow cannot express the waterfall loops of the
+ * common lowering, so no loops are introduced. Correct, not fast. */
 #define APPLE9_SUBGROUP_SIZE 32
 
 static nir_def *
@@ -5457,6 +5499,38 @@ apple9_fold(nir_builder *b, nir_op op, nir_def *x, nir_def *id,
 }
 
 static bool
+apple9_native_shuffles_enabled(void)
+{
+   return !getenv("AGX_APPLE9_EMULATE_SUBGROUPS") &&
+          !getenv("AGX_APPLE9_NO_NATIVE_SHUFFLE");
+}
+
+/* Whether a scalar shuffle of at most 32 bits uses native instructions. */
+static bool
+apple9_shuffle_is_native(nir_intrinsic_instr *intr)
+{
+   return apple9_shuffle_kind(intr->intrinsic) >= 0 &&
+          apple9_native_shuffles_enabled() &&
+          intr->def.num_components == 1 && intr->def.bit_size <= 32;
+}
+
+/* The native register operand (lane, offset or mask) is not per lane. On
+ * T8132 each quad reads it from one of its active lanes; the destination
+ * quad's value picks the source quad and the source quad's own value picks
+ * the position inside it. One instruction is therefore exact only for
+ * operands that are constant or uniform across the active lanes (needs
+ * divergence analysis on the shader). Active lanes may sit in divergent
+ * control flow; inactive lanes' registers are never consulted. */
+static bool
+apple9_shuffle_operand_uniform(nir_intrinsic_instr *intr)
+{
+   return nir_src_is_const(intr->src[1]) ||
+          !nir_src_is_divergent(&intr->src[1]) ||
+          /* Hardware experiments only: wrong for per-lane operands. */
+          getenv("AGX_APPLE9_NATIVE_SHUFFLE_DIVERGENT");
+}
+
+static bool
 apple9_native_subgroup(const nir_intrinsic_instr *intr)
 {
    if (getenv("AGX_APPLE9_EMULATE_SUBGROUPS"))
@@ -5487,6 +5561,31 @@ apple9_lower_subgroup_instr(nir_builder *b, nir_intrinsic_instr *intr,
 
    b->cursor = nir_before_instr(&intr->instr);
    nir_def *rep = NULL;
+
+   if (apple9_shuffle_is_native(intr) && apple9_shuffle_operand_uniform(intr)) {
+      if (intr->def.bit_size == 32)
+         return false;
+      /* Narrow values (16-bit, 8-bit, booleans) shuffle as 32-bit lanes. */
+      nir_def *wide = apple9_to_lane32(b, intr->src[0].ssa);
+      nir_def *operand = intr->src[1].ssa;
+      switch (intr->intrinsic) {
+      case nir_intrinsic_shuffle:
+         rep = nir_shuffle(b, wide, operand);
+         break;
+      case nir_intrinsic_shuffle_xor:
+         rep = nir_shuffle_xor(b, wide, operand);
+         break;
+      case nir_intrinsic_shuffle_up:
+         rep = nir_shuffle_up(b, wide, operand);
+         break;
+      default:
+         rep = nir_shuffle_down(b, wide, operand);
+         break;
+      }
+      nir_def_replace(&intr->def,
+                      apple9_from_lane32(b, rep, intr->def.bit_size));
+      return true;
+   }
 
    /* Near-native forms: widen 16-bit float reductions to the native 32-bit
     * instruction, and build inclusive float scans from the exclusive one. */
@@ -5616,6 +5715,9 @@ apple9_lower_unsupported_subgroups(nir_shader *nir)
       .lower_inverse_ballot = true,
    };
    bool progress = nir_lower_subgroups(nir, &options);
+   /* Native shuffles need to know which lane operands are uniform. */
+   if (apple9_native_shuffles_enabled())
+      nir_divergence_analysis(nir);
    progress |= nir_shader_intrinsics_pass(nir, apple9_lower_subgroup_instr,
                                           nir_metadata_control_flow, NULL);
    return progress;

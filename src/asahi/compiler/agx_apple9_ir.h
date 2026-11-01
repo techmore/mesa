@@ -760,6 +760,21 @@ bool agx_apple9_pack_device_atomic(
    enum agx_apple9_scoreboard_slot input_dependency,
    struct agx_apple9_packed_instruction *packed);
 
+/* AGX_APPLE9_VIR_SUBGROUP_BROADCAST with a shuffle encoding: the immediate's
+ * low bits pick the lane relation; the immediate form carries a constant
+ * lane/offset/mask in bits 8..12 and the register form a lane/offset/mask
+ * operand in src[1]. The plain broadcast encoding keeps immediate 0. */
+enum agx_apple9_shuffle_kind {
+   AGX_APPLE9_SHUFFLE_INDEX = 0,
+   AGX_APPLE9_SHUFFLE_XOR = 1,
+   AGX_APPLE9_SHUFFLE_UP = 2,
+   AGX_APPLE9_SHUFFLE_DOWN = 3,
+};
+
+#define AGX_APPLE9_SHUFFLE_KIND_MASK 0x3u
+#define AGX_APPLE9_SHUFFLE_IMM(kind, value) ((kind) | ((value) << 8))
+#define AGX_APPLE9_SHUFFLE_IMM_VALUE(imm) (((imm) >> 8) & 0x1f)
+
 #ifdef __cplusplus
 }
 #endif

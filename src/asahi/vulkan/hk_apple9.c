@@ -39,7 +39,7 @@ hk_apple9_coopmat_enabled(const struct agx_device *dev)
 {
    static int enabled = -1;
    if (enabled < 0)
-      enabled = debug_get_bool_option("HK_APPLE9_COOPMAT", false);
+      enabled = debug_get_bool_option("HK_APPLE9_COOPMAT", true);
    return enabled && hk_apple9_compute_enabled(dev);
 }
 

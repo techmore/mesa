@@ -239,7 +239,8 @@ hk_get_device_features(
    struct vk_features *features)
 {
    *features = (struct vk_features){
-      /* VK_KHR_cooperative_matrix (Apple9 compute, opt-in) */
+      /* VK_KHR_cooperative_matrix (Apple9 compute; HK_APPLE9_COOPMAT=0
+       * turns it off) */
       .cooperativeMatrix = hk_apple9_coopmat_enabled(dev),
       .cooperativeMatrixRobustBufferAccess = false,
 

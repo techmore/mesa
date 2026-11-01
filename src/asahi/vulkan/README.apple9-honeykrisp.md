@@ -460,10 +460,11 @@ Warren's G13 lowering verified on an M1. fp32 fragments are a register pair
 one register. A transposed `simdgroup_load` becomes two scalar loads per lane
 into the same registers, with the MAC unchanged.
 
-### VK_KHR_cooperative_matrix on Apple9 (opt-in)
+### VK_KHR_cooperative_matrix on Apple9
 
-`HK_APPLE9_COOPMAT=1` makes Apple9 compute advertise `VK_KHR_cooperative_matrix`
-with one shape: fp32 8x8x8, subgroup scope. `agx_nir_lower_apple9_cmat`
+Apple9 compute advertises `VK_KHR_cooperative_matrix` by default
+(`HK_APPLE9_COOPMAT=0` turns it off) with one shape: fp32 8x8x8, subgroup
+scope. `agx_nir_lower_apple9_cmat`
 (after Joshua Warren's G13 lowering) turns each matrix into the lane's two
 fragment elements, loads and stores into ordinary per-lane accesses (the
 backend pairs adjacent words into 64-bit loads), and each 8x8x8 step into
@@ -472,7 +473,13 @@ or B operands widen to fp32 first (omarchy-mlx's f16 kernel multiplies an
 fp16 activation tile by fp32 weights); 16x16 matrices tile into 8x8 blocks.
 Both work but are not advertised. Only compute shaders whose workgroup size
 is a static multiple of 32 are lowered, since the instruction uses every
-lane; other cooperative-matrix shaders fail to compile.
+lane; other cooperative-matrix shaders fail pipeline creation. Vulkan
+already requires a subgroup-scope cooperative-matrix shader's local X size
+to be a multiple of the subgroup size
+(`VUID-VkPipelineShaderStageCreateInfo-module-08987`), so only invalid
+shaders are refused. Column-major loads and stores are exact against the
+CPU (C^T = B^T A^T through column-major views, 8x8x8 to 128x64x256 and
+non-square 24x40x16).
 
 Pending loads that feed the instruction are retired with explicit waits;
 it does not yet fold them into its own wait mask.
@@ -550,9 +557,8 @@ switch for the base M4 until Gravity publishes a qualified build.
   four-shuffle expansion of `simd_shuffle` is not decoded yet.
 
 - Cooperative matrix: fold load waits into the instruction's wait mask,
-  map the fp16-accumulator form, advertise fp16 and 16x16 shapes once
-  tested more widely, test column-major loads and stores, and turn
-  `HK_APPLE9_COOPMAT` on by default.
+  map the fp16-accumulator form, and advertise fp16 and 16x16 shapes once
+  tested more widely.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single
   instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not

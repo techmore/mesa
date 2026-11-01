@@ -178,6 +178,9 @@ enum agx_apple9_vir_opcode {
    AGX_APPLE9_VIR_PRIVATE_STORE,
    AGX_APPLE9_VIR_SPILL_STORE,
    AGX_APPLE9_VIR_SPILL_LOAD,
+   /* SIMD-group 8x8x8 fp32 matrix multiply-accumulate, D = A * B + C. Sources
+    * are three adjacent pairs (A, B, C); the destination is a pair. */
+   AGX_APPLE9_VIR_SIMD_MATRIX_FMADD,
 };
 
 enum agx_apple9_unpack_norm_mode {
@@ -568,6 +571,8 @@ uint32_t agx_apple9_vir_emit_cube(struct agx_apple9_vir_program *program,
                                  const uint32_t src[3], unsigned mode);
 uint32_t agx_apple9_vir_emit_unpack_norm(struct agx_apple9_vir_program *program,
                                         uint32_t src, unsigned mode);
+uint32_t agx_apple9_vir_emit_simd_matrix_fmadd(
+   struct agx_apple9_vir_program *program, const uint32_t src[6]);
 uint32_t agx_apple9_vir_emit_mul_wide(struct agx_apple9_vir_program *program,
                                      const uint32_t src[2], bool is_signed);
 

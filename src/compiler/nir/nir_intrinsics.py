@@ -2470,6 +2470,13 @@ intrinsic("quad_ballot_agx", src_comp=[1], dest_comp=1, flags=[CAN_ELIMINATE])
 # for [-1, 1].
 system_value("clip_z_coeff", 1)
 
+# Apple SIMD-group matrix multiply-accumulate: one 8x8x8 tile across the 32
+# lanes of a subgroup, D = A * B + C. Each source is this lane's two fragment
+# elements (a register pair for fp32). src order: A, B, C. Requires all 32
+# lanes of the subgroup to be active.
+intrinsic("simd_matrix_fmadd_agx", src_comp=[2, 2, 2], dest_comp=2,
+          bit_sizes=[32], flags=[CAN_ELIMINATE])
+
 # True if drawing triangle fans with first vertex provoking, false otherwise.
 # This affects flatshading, which is defined weirdly for fans with first.
 system_value("is_first_fan_agx", 1, bit_sizes=[1])

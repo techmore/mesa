@@ -252,6 +252,10 @@ agx_apple9_vir_finish(struct agx_apple9_vir_program *program)
    agx_apple9_vir_init(program);
 }
 
+static bool
+apple9_vir_values_form_tuple(const struct agx_apple9_vir_program *program,
+                             const uint32_t *values, unsigned components);
+
 static uint32_t
 apple9_vir_new_value(struct agx_apple9_vir_program *program,
                      unsigned fixed_phys)
@@ -562,6 +566,34 @@ agx_apple9_vir_emit_unpack_norm(struct agx_apple9_vir_program *program,
    uint32_t value = agx_apple9_vir_emit(program, AGX_APPLE9_VIR_UNPACK_NORM,
                                        AGX_APPLE9_ENC_UNPACK_NORM, &src, 1, mode);
    if (value == AGX_APPLE9_VREG_INVALID || !apple9_vir_append_values(program, 1))
+      return AGX_APPLE9_VREG_INVALID;
+   program->instructions[program->instruction_count - 1]->dest_components = 2;
+   return value;
+}
+
+uint32_t
+agx_apple9_vir_emit_simd_matrix_fmadd(struct agx_apple9_vir_program *program,
+                                      const uint32_t src[6])
+{
+   uint32_t sources[6];
+   for (unsigned s = 0; s < 3; ++s) {
+      const uint32_t pair[2] = {src[2 * s], src[2 * s + 1]};
+      if (pair[0] >= program->value_count || pair[1] >= program->value_count)
+         return AGX_APPLE9_VREG_INVALID;
+      uint32_t base = pair[0];
+      if (!apple9_vir_values_form_tuple(program, pair, 2)) {
+         base = agx_apple9_vir_emit_collect(program, pair, 2);
+         if (base == AGX_APPLE9_VREG_INVALID)
+            return base;
+      }
+      sources[2 * s] = base;
+      sources[2 * s + 1] = base + 1;
+   }
+   uint32_t value = agx_apple9_vir_emit(
+      program, AGX_APPLE9_VIR_SIMD_MATRIX_FMADD,
+      AGX_APPLE9_ENC_SIMD_MATRIX_FMADD, sources, 6, 0);
+   if (value == AGX_APPLE9_VREG_INVALID ||
+       !apple9_vir_append_values(program, 1))
       return AGX_APPLE9_VREG_INVALID;
    program->instructions[program->instruction_count - 1]->dest_components = 2;
    return value;
@@ -2149,6 +2181,7 @@ agx_apple9_validate_vir_allocation(const struct agx_apple9_vir_program *program,
           instruction->dest > program->value_count - components ||
           (components > 1 && instruction->op != AGX_APPLE9_VIR_DEVICE_LOAD &&
            instruction->op != AGX_APPLE9_VIR_UNPACK_NORM &&
+           instruction->op != AGX_APPLE9_VIR_SIMD_MATRIX_FMADD &&
            instruction->op != AGX_APPLE9_VIR_ITER_FLAT &&
            instruction->op != AGX_APPLE9_VIR_COLLECT &&
            instruction->op != AGX_APPLE9_VIR_PUBLICATION_TUPLE &&
@@ -4713,6 +4746,47 @@ pack_mul_wide(const struct agx_apple9_vir_instr *I, const uint8_t *phys,
    return true;
 }
 
+/* fp32 SIMD-group matrix multiply-accumulate (README.apple9-honeykrisp.md).
+ * Operand cache hints stay clear (an observed valid combination); a source
+ * pair whose words are both dead gets its discard bit, like Apple's code. */
+static bool
+pack_simd_matrix_fmadd(const struct agx_apple9_vir_instr *I,
+                       const uint8_t *phys,
+                       struct agx_apple9_packed_instruction *packed)
+{
+   if (I->encoding != AGX_APPLE9_ENC_SIMD_MATRIX_FMADD || I->nr_srcs != 6 ||
+       I->dest_components != 2 || I->immediate ||
+       I->alu_src_uniform_mask || I->alu_src_immediate_mask ||
+       I->src_abs_mask || I->src_neg_mask || I->saturate)
+      return false;
+   const unsigned d = phys[I->dest];
+   if (d + 1 >= AGX_APPLE9_GPR_COUNT || phys[I->dest + 1] != d + 1)
+      return false;
+   unsigned r[3];
+   for (unsigned s = 0; s < 3; ++s) {
+      r[s] = phys[I->src[2 * s]];
+      if (r[s] + 1 >= AGX_APPLE9_GPR_COUNT ||
+          phys[I->src[2 * s + 1]] != r[s] + 1)
+         return false;
+   }
+
+   uint8_t bytes[12] = {0xcf, 0x02, 0x54, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x54, 0x40, 0x24, 0x01};
+   set_bits(bytes, 24, 7, d);
+   set_bits(bytes, 41, 6, r[0] & 63);
+   set_bits(bytes, 40, 1, r[0] >> 6);
+   set_bits(bytes, 49, 7, r[1]);
+   static const uint8_t c_bit[7] = {57, 56, 59, 58, 61, 60, 63};
+   for (unsigned k = 0; k < 7; ++k)
+      set_bits(bytes, c_bit[k], 1, (r[2] >> k) & 1);
+   for (unsigned s = 0; s < 3; ++s) {
+      const bool live = I->live_after_mask & (3u << (2 * s));
+      set_bits(bytes, 71 + s, 1, !live);
+   }
+   packed_init(packed, bytes, sizeof(bytes));
+   return true;
+}
+
 static bool
 pack_compact_binary_gprs(uint8_t *bytes, unsigned dst, unsigned a, unsigned b,
                          unsigned destination_count)
@@ -5717,6 +5791,8 @@ pack_vir_instruction_body(const struct agx_apple9_vir_instr *instruction,
    }
    case AGX_APPLE9_VIR_IMUL_WIDE:
       return pack_mul_wide(instruction, phys, packed);
+   case AGX_APPLE9_VIR_SIMD_MATRIX_FMADD:
+      return pack_simd_matrix_fmadd(instruction, phys, packed);
    case AGX_APPLE9_VIR_SPILL_STORE: {
       unsigned slot = instruction->producer_scoreboard_slot;
       unsigned word = instruction->immediate;

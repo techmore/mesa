@@ -789,6 +789,7 @@ apple9_instruction_is_in_subset(nir_instr *instr, bool graphics)
              op == nir_intrinsic_shuffle_xor ||
              op == nir_intrinsic_shuffle_up ||
              op == nir_intrinsic_shuffle_down ||
+             op == nir_intrinsic_simd_matrix_fmadd_agx ||
              op == nir_intrinsic_ballot ||
              op == nir_intrinsic_load_scratch ||
              op == nir_intrinsic_store_scratch ||
@@ -1819,7 +1820,30 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             nir_intrinsic_load_subgroup_size;
       nir_intrinsic_instr *intr = nir_def_instr_type(scalar.def) == nir_instr_type_intrinsic
          ? nir_def_as_intrinsic(scalar.def) : NULL;
-      if (intr && intr->intrinsic == nir_intrinsic_ballot) {
+      if (intr && intr->intrinsic == nir_intrinsic_simd_matrix_fmadd_agx) {
+         if (scalar.def->bit_size != 32 || scalar.def->num_components != 2) {
+            lower->reason = "Apple9 matrix multiply-accumulate needs fp32 pairs";
+            return AGX_APPLE9_VREG_INVALID;
+         }
+         uint32_t sources[6];
+         for (unsigned s = 0; s < 3; ++s) {
+            for (unsigned c = 0; c < 2; ++c) {
+               sources[2 * s + c] = apple9_lower_dag_scalar(
+                  lower, nir_get_scalar(intr->src[s].ssa, c));
+               if (sources[2 * s + c] == AGX_APPLE9_VREG_INVALID)
+                  return AGX_APPLE9_VREG_INVALID;
+            }
+         }
+         uint32_t result =
+            agx_apple9_vir_emit_simd_matrix_fmadd(&lower->program, sources);
+         if (result == AGX_APPLE9_VREG_INVALID) {
+            lower->reason = "could not emit an Apple9 matrix multiply-accumulate";
+            return AGX_APPLE9_VREG_INVALID;
+         }
+         lower->ssa_to_vreg[scalar.def->index * 4] = result;
+         lower->ssa_to_vreg[scalar.def->index * 4 + 1] = result + 1;
+         value = result + scalar.comp;
+      } else if (intr && intr->intrinsic == nir_intrinsic_ballot) {
          if (scalar.def->bit_size != 32 || scalar.def->num_components != 1)
             return AGX_APPLE9_VREG_INVALID;
          uint32_t source = apple9_lower_dag_scalar(lower,

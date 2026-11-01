@@ -129,6 +129,10 @@ agx_drm_bo_bind(struct agx_device *dev, struct drm_asahi_gem_bind_op *ops,
    int ret = drmIoctl(dev->fd, DRM_IOCTL_ASAHI_VM_BIND, &vm_bind);
    if (ret) {
       fprintf(stderr, "DRM_IOCTL_ASAHI_VM_BIND failed: %m\n");
+      for (uint32_t i = 0; i < count; ++i)
+         fprintf(stderr, "  bind[%u] addr=0x%llx range=0x%llx flags=0x%x handle=%u\n", i,
+                 (unsigned long long)ops[i].addr, (unsigned long long)ops[i].range,
+                 ops[i].flags, ops[i].handle);
    }
 
    return ret;

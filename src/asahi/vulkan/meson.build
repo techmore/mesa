@@ -9,6 +9,8 @@ hk_files = files(
   'hk_cmd_buffer.h',
   'hk_cmd_clear.c',
   'hk_cmd_dispatch.c',
+  'hk_apple9.c',
+  'hk_apple9.h',
   'hk_cmd_draw.c',
   'hk_cmd_meta.c',
   'hk_cmd_pool.c',
@@ -90,6 +92,9 @@ libhk = static_library(
     hk_entrypoints,
     hk_drirc,
     hk_files,
+    files('../../gallium/drivers/asahi/agx_apple9.c',
+          '../../gallium/drivers/asahi/agx_apple9_launch.c',
+          '../../gallium/drivers/asahi/agx_apple9_geometry.c'),
     sha1_h,
   ],
   include_directories : [

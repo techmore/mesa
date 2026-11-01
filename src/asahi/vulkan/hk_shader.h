@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include "hk_apple9.h"
+
 #include "asahi/compiler/agx_compile.h"
 #include "poly/nir/poly_nir.h"
 #include "util/macros.h"
@@ -165,6 +167,9 @@ struct hk_shader {
 
    /* Address of the start of the shader data section */
    uint64_t data_addr;
+
+   /* Apple9 (M4) compute program, when enabled */
+   struct hk_apple9_shader apple9;
 };
 
 enum hk_vs_variant {

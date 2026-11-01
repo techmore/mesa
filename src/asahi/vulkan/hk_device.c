@@ -7,6 +7,8 @@
 #include "hk_device.h"
 
 #include "agx_bg_eot.h"
+#include "gallium/drivers/asahi/agx_apple9.h"
+#include "hk_apple9.h"
 #include "agx_helpers.h"
 #include "agx_scratch.h"
 #include "hk_cmd_buffer.h"
@@ -374,6 +376,9 @@ hk_CreateDevice(VkPhysicalDevice physicalDevice,
       goto fail_queries;
 
    /* XXX: error handling, and should this even go on the device? */
+   if (hk_apple9_compute_enabled(&dev->dev))
+      agx_apple9_initialize_entries(&dev->dev);
+
    agx_bg_eot_init(&dev->bg_eot, &dev->dev);
    if (!dev->bg_eot.ht) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;

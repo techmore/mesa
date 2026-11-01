@@ -115,6 +115,20 @@ hk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      UNUSED mesa_shader_stage stage,
                      const struct vk_pipeline_robustness_state *rs)
 {
+   struct hk_physical_device *pdev =
+      container_of(vk_pdev, struct hk_physical_device, vk);
+
+   if (hk_apple9_compute_enabled(&pdev->dev)) {
+      return (struct spirv_to_nir_options){
+         .ssbo_addr_format = nir_address_format_32bit_index_offset,
+         .phys_ssbo_addr_format = nir_address_format_2x32bit_global,
+         .ubo_addr_format = nir_address_format_32bit_index_offset,
+         .shared_addr_format = nir_address_format_32bit_offset,
+         .min_ssbo_alignment = HK_MIN_SSBO_ALIGNMENT,
+         .min_ubo_alignment = HK_MIN_UBO_ALIGNMENT,
+      };
+   }
+
    return (struct spirv_to_nir_options){
       .ssbo_addr_format = hk_buffer_addr_format(rs->storage_buffers),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
@@ -182,9 +196,41 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
 }
 
 static void
+hk_apple9_preprocess_nir(nir_shader *nir)
+{
+   bool progress;
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_loop);
+      NIR_PASS(progress, nir, nir_opt_loop_unroll);
+   } while (progress);
+
+   NIR_PASS(_, nir, nir_lower_system_values);
+   nir_lower_compute_system_values_options csv_options = {0};
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   NIR_PASS(_, nir, nir_split_var_copies);
+   NIR_PASS(_, nir, nir_lower_var_copies);
+}
+
+static void
 hk_preprocess_nir(struct vk_physical_device *vk_pdev, nir_shader *nir,
                   UNUSED const struct vk_pipeline_robustness_state *rs)
 {
+   struct hk_physical_device *pdev =
+      container_of(vk_pdev, struct hk_physical_device, vk);
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       hk_apple9_compute_enabled(&pdev->dev)) {
+      hk_apple9_preprocess_nir(nir);
+      return;
+   }
+
    hk_preprocess_nir_internal(vk_pdev, nir);
    nir_lower_compute_system_values_options csv_options = {
       .has_base_workgroup_id = true,
@@ -1257,6 +1303,8 @@ hk_shader_destroy(struct hk_device *dev, struct hk_shader *s)
    free((void *)s->code_ptr);
    free((void *)s->data_ptr);
    agx_bo_unreference(&dev->dev, s->bo);
+   if (s->apple9.body)
+      agx_bo_unreference(&dev->dev, s->apple9.body);
 
    simple_mtx_destroy(&s->linked.lock);
 
@@ -1307,6 +1355,20 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
    if (obj == NULL) {
       ralloc_free(nir);
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE &&
+       hk_apple9_compute_enabled(&dev->dev)) {
+      result = hk_apple9_compile_compute(dev, nir, info->set_layout_count,
+                                         info->set_layouts,
+                                         hk_only_variant(obj));
+      if (result != VK_SUCCESS) {
+         hk_api_shader_destroy(&dev->vk, &obj->vk, pAllocator);
+         return result;
+      }
+
+      *shader_out = obj;
+      return VK_SUCCESS;
    }
 
    if (!nir->info.io_lowered) {
@@ -1552,6 +1614,13 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
       enum hk_feature_key hk_features = hk_make_feature_key(features);
       nir_shader *nir = info->nir;
 
+      /* Apple9 compute goes through its own lowering in hk_compile_shader. */
+      if (nir->info.stage == MESA_SHADER_COMPUTE &&
+          hk_apple9_compute_enabled(&dev->dev)) {
+         shaders[i] = nir;
+         continue;
+      }
+
       hk_lower_nir(dev, nir, info->robustness, is_multiview,
                    info->set_layout_count, info->set_layouts, hk_features);
 
@@ -1689,6 +1758,11 @@ hk_api_shader_serialize(struct vk_device *vk_dev,
 {
    struct hk_api_shader *obj =
       container_of(vk_shader, struct hk_api_shader, vk);
+
+   hk_foreach_variant(obj, shader) {
+      if (shader->apple9.enabled)
+         return false;
+   }
 
    blob_write_uint8(blob, vk_shader->stage);
 

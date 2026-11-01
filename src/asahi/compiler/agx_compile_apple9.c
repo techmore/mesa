@@ -4,6 +4,7 @@
  */
 
 #include "agx_compile_apple9.h"
+#include "asahi/lib/agx_apple9_layout.h"
 #include "agx_apple9_ir.h"
 #include "agx_nir.h"
 #include "agx_nir_texture.h"
@@ -782,6 +783,7 @@ apple9_instruction_is_in_subset(nir_instr *instr, bool graphics)
              op == nir_intrinsic_load_subgroup_size ||
              op == nir_intrinsic_inclusive_scan ||
              op == nir_intrinsic_exclusive_scan ||
+             op == nir_intrinsic_reduce ||
              op == nir_intrinsic_read_invocation ||
              op == nir_intrinsic_ballot ||
              op == nir_intrinsic_load_scratch ||
@@ -880,6 +882,45 @@ apple9_current_load_flags(struct apple9_dag_lower *lower)
                       : 0;
 
    return flags;
+}
+
+/* Native Apple9 subgroup form for a 32-bit scalar reduction or scan, or -1. */
+static int
+apple9_subgroup_form(const nir_intrinsic_instr *intr)
+{
+   if (intr->def.bit_size != 32 || intr->def.num_components != 1)
+      return -1;
+   nir_op op = nir_intrinsic_reduction_op(intr);
+   if (intr->intrinsic == nir_intrinsic_reduce) {
+      unsigned cluster = nir_intrinsic_cluster_size(intr);
+      if (cluster && cluster < 32)
+         return -1;
+      switch (op) {
+      case nir_op_iadd: return AGX_APPLE9_SUBGROUP_REDUCE_IADD;
+      case nir_op_fadd: return AGX_APPLE9_SUBGROUP_REDUCE_FADD;
+      case nir_op_fmul: return AGX_APPLE9_SUBGROUP_REDUCE_FMUL;
+      case nir_op_umin: return AGX_APPLE9_SUBGROUP_REDUCE_UMIN;
+      case nir_op_umax: return AGX_APPLE9_SUBGROUP_REDUCE_UMAX;
+      case nir_op_imin: return AGX_APPLE9_SUBGROUP_REDUCE_IMIN;
+      case nir_op_imax: return AGX_APPLE9_SUBGROUP_REDUCE_IMAX;
+      case nir_op_fmin: return AGX_APPLE9_SUBGROUP_REDUCE_FMIN;
+      case nir_op_fmax: return AGX_APPLE9_SUBGROUP_REDUCE_FMAX;
+      case nir_op_iand: return AGX_APPLE9_SUBGROUP_REDUCE_IAND;
+      case nir_op_ior: return AGX_APPLE9_SUBGROUP_REDUCE_IOR;
+      case nir_op_ixor: return AGX_APPLE9_SUBGROUP_REDUCE_IXOR;
+      default: return -1;
+      }
+   }
+   if (intr->intrinsic == nir_intrinsic_exclusive_scan ||
+       intr->intrinsic == nir_intrinsic_inclusive_scan) {
+      switch (op) {
+      case nir_op_iadd: return AGX_APPLE9_SUBGROUP_SCAN_EXCL_IADD;
+      case nir_op_fadd: return AGX_APPLE9_SUBGROUP_SCAN_EXCL_FADD;
+      case nir_op_fmul: return AGX_APPLE9_SUBGROUP_SCAN_EXCL_FMUL;
+      default: return -1;
+      }
+   }
+   return -1;
 }
 
 static uint32_t
@@ -1785,6 +1826,23 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
          if (value != AGX_APPLE9_VREG_INVALID)
             lower->program.instructions[lower->program.instruction_count - 1]
                ->producer_scoreboard_slot = AGX_APPLE9_SCOREBOARD_SLOT_6;
+      } else if (intr && intr->intrinsic == nir_intrinsic_reduce) {
+         int form = apple9_subgroup_form(intr);
+         if (form < 0) {
+            lower->reason = "Apple9 subgroup reduction form is not native";
+            return AGX_APPLE9_VREG_INVALID;
+         }
+         uint32_t source = apple9_lower_dag_scalar(lower,
+            nir_get_scalar(intr->src[0].ssa, scalar.comp));
+         value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SUBGROUP_SCAN_IADD,
+            AGX_APPLE9_ENC_SUBGROUP_SCAN_IADD, &source, 1, form);
+      } else if (intr && intr->intrinsic == nir_intrinsic_exclusive_scan &&
+                 apple9_subgroup_form(intr) > 0) {
+         uint32_t source = apple9_lower_dag_scalar(lower,
+            nir_get_scalar(intr->src[0].ssa, scalar.comp));
+         value = apple9_dag_emit(lower, AGX_APPLE9_VIR_SUBGROUP_SCAN_IADD,
+            AGX_APPLE9_ENC_SUBGROUP_SCAN_IADD, &source, 1,
+            apple9_subgroup_form(intr));
       } else if (intr && (intr->intrinsic == nir_intrinsic_inclusive_scan ||
                    intr->intrinsic == nir_intrinsic_exclusive_scan)) {
          if (scalar.def->bit_size != 32 ||
@@ -2335,6 +2393,15 @@ apple9_lower_dag_scalar(struct apple9_dag_lower *lower, nir_scalar scalar)
             uint32_t source = apple9_lower_dag_source(lower, scalar, 0);
             if (source != AGX_APPLE9_VREG_INVALID) {
                unsigned bits = nir_scalar_chase_alu_src(scalar, 0).def->bit_size;
+               /* Float-to-integer conversion reads a 32-bit float. Widen a
+                * half source first, or its bits read as a tiny FP32 value. */
+               if (bits == 16 && (op == nir_op_f2i32 || op == nir_op_f2u32)) {
+                  source = apple9_dag_emit(lower, AGX_APPLE9_VIR_UNPACK_HALF,
+                                           AGX_APPLE9_ENC_HALF_TO_FLOAT,
+                                           &source, 1, 0);
+                  if (source == AGX_APPLE9_VREG_INVALID)
+                     return source;
+               }
                /* Narrow NIR values may retain arbitrary upper register bits.
                 * Extend at selection: algebraic passes can fold away an
                 * earlier i2i32/u2u32 before the float conversion. */
@@ -2676,7 +2743,7 @@ apple9_collect_buffer_map(nir_shader *nir, struct apple9_buffer_map *map,
          apple9_compare_buffer_resource);
    if (nir->info.shared_size) {
       if (nir->info.stage != MESA_SHADER_COMPUTE ||
-          nir->info.shared_size > 1024 ||
+          nir->info.shared_size > agx_apple9_max_shared_bytes() ||
           map->count == AGX_APPLE9_COMPUTE_MAX_RESOURCES) {
          *reason = "Apple9 shared memory exceeds the supported compute allocation";
          return false;
@@ -5116,6 +5183,255 @@ apple9_lower_compute_subgroups(nir_builder *b, nir_intrinsic_instr *intr,
 
 static void apple9_lower_textures(nir_shader *nir);
 
+/* Subgroup operations without a native Apple9 encoding. Native today: ballot,
+ * broadcast (read_invocation) and 32-bit integer-add scans. Everything else is
+ * rebuilt from 32 straight-line broadcasts, one per lane, combined with
+ * selects. Apple9 structured control flow cannot express the waterfall loops
+ * of the common lowering, so no loops are introduced. Correct, not fast. */
+#define APPLE9_SUBGROUP_SIZE 32
+
+static nir_def *
+apple9_to_lane32(nir_builder *b, nir_def *x)
+{
+   if (x->bit_size == 1)
+      return nir_b2i32(b, x);
+   if (x->bit_size < 32)
+      return nir_u2u32(b, x);
+   return x;
+}
+
+static nir_def *
+apple9_from_lane32(nir_builder *b, nir_def *x, unsigned bit_size)
+{
+   if (bit_size == 1)
+      return nir_ine_imm(b, x, 0);
+   if (bit_size < 32)
+      return nir_u2uN(b, x, bit_size);
+   return x;
+}
+
+/* Broadcast any scalar width from lane k (an immediate). */
+static nir_def *
+apple9_read_lane(nir_builder *b, nir_def *x, unsigned k)
+{
+   nir_def *lane = nir_imm_int(b, k);
+   if (x->bit_size == 64) {
+      nir_def *lo = nir_read_invocation(b, nir_unpack_64_2x32_split_x(b, x), lane);
+      nir_def *hi = nir_read_invocation(b, nir_unpack_64_2x32_split_y(b, x), lane);
+      return nir_pack_64_2x32_split(b, lo, hi);
+   }
+   nir_def *v = nir_read_invocation(b, apple9_to_lane32(b, x), lane);
+   return apple9_from_lane32(b, v, x->bit_size);
+}
+
+static nir_def *
+apple9_active_mask(nir_builder *b)
+{
+   return nir_ballot(b, 1, 32, nir_imm_true(b));
+}
+
+static nir_def *
+apple9_shuffle(nir_builder *b, nir_def *x, nir_def *index)
+{
+   nir_def *result = nir_undef(b, 1, x->bit_size);
+   for (unsigned k = 0; k < APPLE9_SUBGROUP_SIZE; ++k) {
+      result = nir_bcsel(b, nir_ieq_imm(b, index, k), apple9_read_lane(b, x, k),
+                         result);
+   }
+   return result;
+}
+
+/* Fold op over the active lanes selected by cond(k). */
+static nir_def *
+apple9_fold(nir_builder *b, nir_op op, nir_def *x, nir_def *id,
+            unsigned cluster, int scan /* 0 reduce, 1 inclusive, -1 exclusive */)
+{
+   nir_def *mask = apple9_active_mask(b);
+   nir_const_value ident = nir_alu_binop_identity(op, x->bit_size);
+   nir_def *acc = nir_build_imm(b, 1, x->bit_size, &ident);
+   unsigned log2c = util_logbase2(cluster);
+
+   for (unsigned k = 0; k < APPLE9_SUBGROUP_SIZE; ++k) {
+      nir_def *active = nir_i2b(b, nir_iand_imm(b, nir_ushr_imm(b, mask, k), 1));
+      nir_def *take = active;
+      if (cluster < APPLE9_SUBGROUP_SIZE)
+         take = nir_iand(b, take,
+                         nir_ieq_imm(b, nir_ushr_imm(b, id, log2c), k >> log2c));
+      if (scan > 0)
+         take = nir_iand(b, take, nir_uge_imm(b, id, k));
+      else if (scan < 0)
+         take = nir_iand(b, take, nir_ult(b, nir_imm_int(b, k), id));
+      nir_def *combined = nir_build_alu2(b, op, acc, apple9_read_lane(b, x, k));
+      acc = nir_bcsel(b, take, combined, acc);
+   }
+   return acc;
+}
+
+static bool
+apple9_native_subgroup(const nir_intrinsic_instr *intr)
+{
+   if (getenv("AGX_APPLE9_EMULATE_SUBGROUPS"))
+      return intr->intrinsic != nir_intrinsic_reduce &&
+             (intr->intrinsic == nir_intrinsic_inclusive_scan ||
+              intr->intrinsic == nir_intrinsic_exclusive_scan) &&
+             intr->def.bit_size == 32 && intr->def.num_components == 1 &&
+             nir_intrinsic_reduction_op(intr) == nir_op_iadd;
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_reduce:
+   case nir_intrinsic_exclusive_scan:
+      return apple9_subgroup_form(intr) >= 0;
+   case nir_intrinsic_inclusive_scan:
+      /* Integer inclusive scans add the source in selection. */
+      return apple9_subgroup_form(intr) == AGX_APPLE9_SUBGROUP_SCAN_EXCL_IADD;
+   default:
+      return false;
+   }
+}
+
+static bool
+apple9_lower_subgroup_instr(nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   if (apple9_native_subgroup(intr))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *rep = NULL;
+
+   /* Near-native forms: widen 16-bit float reductions to the native 32-bit
+    * instruction, and build inclusive float scans from the exclusive one. */
+   if (!getenv("AGX_APPLE9_EMULATE_SUBGROUPS") &&
+       (intr->intrinsic == nir_intrinsic_reduce ||
+        intr->intrinsic == nir_intrinsic_inclusive_scan) &&
+       intr->def.num_components == 1) {
+      nir_op op = nir_intrinsic_reduction_op(intr);
+      bool float_op = op == nir_op_fadd || op == nir_op_fmul ||
+                      op == nir_op_fmin || op == nir_op_fmax;
+      unsigned cluster = intr->intrinsic == nir_intrinsic_reduce
+                            ? nir_intrinsic_cluster_size(intr) : 0;
+      if (intr->intrinsic == nir_intrinsic_reduce && float_op &&
+          intr->def.bit_size == 16 && (!cluster || cluster >= 32)) {
+         nir_def *wide = nir_reduce(b, nir_f2f32(b, intr->src[0].ssa),
+                                    .reduction_op = op);
+         nir_def_replace(&intr->def, nir_f2f16(b, wide));
+         return true;
+      }
+      if (intr->intrinsic == nir_intrinsic_inclusive_scan &&
+          intr->def.bit_size == 32 && (op == nir_op_fadd || op == nir_op_fmul)) {
+         nir_def *x = intr->src[0].ssa;
+         nir_def *excl = nir_exclusive_scan(b, x, .reduction_op = op);
+         nir_def_replace(&intr->def, nir_build_alu2(b, op, excl, x));
+         return true;
+      }
+   }
+
+   if (getenv("AGX_APPLE9_REPORT_EMULATED"))
+      fprintf(stderr, "apple9: emulated subgroup op %s (%u-bit)\n",
+              nir_intrinsic_infos[intr->intrinsic].name, intr->def.bit_size);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_shuffle:
+      rep = apple9_shuffle(b, intr->src[0].ssa, intr->src[1].ssa);
+      break;
+   case nir_intrinsic_shuffle_xor:
+      rep = apple9_shuffle(b, intr->src[0].ssa,
+                           nir_ixor(b, nir_load_subgroup_invocation(b),
+                                    intr->src[1].ssa));
+      break;
+   case nir_intrinsic_shuffle_up:
+      rep = apple9_shuffle(b, intr->src[0].ssa,
+                           nir_isub(b, nir_load_subgroup_invocation(b),
+                                    intr->src[1].ssa));
+      break;
+   case nir_intrinsic_shuffle_down:
+      rep = apple9_shuffle(b, intr->src[0].ssa,
+                           nir_iadd(b, nir_load_subgroup_invocation(b),
+                                    intr->src[1].ssa));
+      break;
+   case nir_intrinsic_reduce: {
+      unsigned cluster = nir_intrinsic_cluster_size(intr);
+      if (!cluster || cluster > APPLE9_SUBGROUP_SIZE)
+         cluster = APPLE9_SUBGROUP_SIZE;
+      rep = apple9_fold(b, nir_intrinsic_reduction_op(intr), intr->src[0].ssa,
+                        nir_load_subgroup_invocation(b), cluster, 0);
+      break;
+   }
+   case nir_intrinsic_inclusive_scan:
+   case nir_intrinsic_exclusive_scan:
+      rep = apple9_fold(b, nir_intrinsic_reduction_op(intr), intr->src[0].ssa,
+                        nir_load_subgroup_invocation(b), APPLE9_SUBGROUP_SIZE,
+                        intr->intrinsic == nir_intrinsic_inclusive_scan ? 1 : -1);
+      break;
+   case nir_intrinsic_first_invocation:
+      rep = nir_find_lsb(b, apple9_active_mask(b));
+      break;
+   case nir_intrinsic_elect:
+      rep = nir_ieq(b, nir_load_subgroup_invocation(b),
+                    nir_find_lsb(b, apple9_active_mask(b)));
+      break;
+   case nir_intrinsic_read_first_invocation: {
+      nir_def *first = nir_find_lsb(b, apple9_active_mask(b));
+      rep = apple9_shuffle(b, intr->src[0].ssa, first);
+      break;
+   }
+   case nir_intrinsic_vote_any:
+      rep = nir_ine_imm(b, nir_ballot(b, 1, 32, intr->src[0].ssa), 0);
+      break;
+   case nir_intrinsic_vote_all:
+      rep = nir_ieq(b, nir_ballot(b, 1, 32, intr->src[0].ssa),
+                    apple9_active_mask(b));
+      break;
+   case nir_intrinsic_ballot_bit_count_reduce:
+      rep = nir_bit_count(b, intr->src[0].ssa);
+      break;
+   case nir_intrinsic_ballot_find_lsb:
+      rep = nir_find_lsb(b, intr->src[0].ssa);
+      break;
+   case nir_intrinsic_ballot_find_msb:
+      rep = nir_ufind_msb(b, intr->src[0].ssa);
+      break;
+   case nir_intrinsic_ballot_bitfield_extract:
+      rep = nir_i2b(b, nir_iand_imm(b, nir_ushr(b, intr->src[0].ssa,
+                                                intr->src[1].ssa), 1));
+      break;
+   default:
+      return false;
+   }
+
+   if (rep->bit_size != intr->def.bit_size)
+      rep = apple9_from_lane32(b, rep, intr->def.bit_size);
+   nir_def_replace(&intr->def, rep);
+   return true;
+}
+
+static bool
+apple9_lower_unsupported_subgroups(nir_shader *nir)
+{
+   /* Common lowering that introduces no loops: vectors to scalars, relative
+    * shuffles/quads/rotates to shuffles, votes and masks to ballots. */
+   const nir_lower_subgroups_options options = {
+      .subgroup_size = APPLE9_SUBGROUP_SIZE,
+      .ballot_bit_size = 32,
+      .ballot_components = 1,
+      .lower_to_scalar = true,
+      .lower_vote_feq = true,
+      .lower_vote_ieq = true,
+      .lower_vote_bool_eq = true,
+      .lower_subgroup_masks = true,
+      .lower_shuffle_to_32bit = true,
+      .lower_quad = true,
+      .lower_quad_broadcast_dynamic = true,
+      .lower_rotate_to_shuffle = true,
+      .lower_rotate_clustered_to_shuffle = true,
+      .lower_inverse_ballot = true,
+   };
+   bool progress = nir_lower_subgroups(nir, &options);
+   progress |= nir_shader_intrinsics_pass(nir, apple9_lower_subgroup_instr,
+                                          nir_metadata_control_flow, NULL);
+   return progress;
+}
+
 bool
 agx_compile_apple9_tiny(nir_shader *nir, struct agx_shader_part *out,
                         struct agx_apple9_compute_profile *profile,
@@ -5133,6 +5449,7 @@ agx_compile_apple9_tiny(nir_shader *nir, struct agx_shader_part *out,
       .lower_to_scalar = true,
    };
    nir_lower_subgroups(nir, &subgroups);
+   apple9_lower_unsupported_subgroups(nir);
    nir_shader_intrinsics_pass(nir, apple9_lower_compute_subgroups,
                               nir_metadata_control_flow, NULL);
 

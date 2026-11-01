@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: MIT
  */
 #include "hk_device_memory.h"
+#include "hk_apple9.h"
 
 #include "hk_device.h"
 #include "hk_entrypoints.h"
@@ -220,12 +221,19 @@ hk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       }
    }
 
-   /* Shadow map in case this is used for a sparse resident buffer */
-   int ret = agx_bo_bind(&dev->dev, mem->bo,
-                         agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
-                         mem->bo->size, 0, DRM_ASAHI_BIND_READ);
-   if (ret)
-      return VK_ERROR_UNKNOWN;
+   /* Shadow map in case this is used for a sparse resident buffer.
+    *
+    * Not on Apple9: the G16 kernel keeps this second mapping after the BO is
+    * closed, so a later allocation at the same address fails with EEXIST.
+    * Apple9 compute resolves buffers to primary addresses and does not use
+    * sparse residency yet. */
+   if (!hk_apple9_compute_enabled(&dev->dev)) {
+      int ret = agx_bo_bind(&dev->dev, mem->bo,
+                            agx_rw_addr_to_ro(&dev->dev, mem->bo->va->addr),
+                            mem->bo->size, 0, DRM_ASAHI_BIND_READ);
+      if (ret)
+         return VK_ERROR_UNKNOWN;
+   }
 
    if (mem->bo->flags & (AGX_BO_SHAREABLE | AGX_BO_SHARED))
       hk_add_ext_bo(dev, mem->bo);

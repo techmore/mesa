@@ -19,7 +19,8 @@ bool
 agx_apple9_launch_threadgroup_memory_supported(uint32_t bytes)
 {
    return bytes == 0 ||
-          (bytes >= 128 && bytes <= 1024 && !(bytes & (bytes - 1)));
+          (bytes >= 128 && bytes <= agx_apple9_max_shared_bytes() &&
+           !(bytes & (bytes - 1)));
 }
 
 size_t
@@ -44,7 +45,9 @@ encode_allocation(uint8_t out[8], enum agx_apple9_launch_stage stage,
    out[2] = 0x2a;
    out[3] = 0x41;
    if (stage == AGX_APPLE9_LAUNCH_COMPUTE && params->threadgroup_memory_bytes) {
-      write16(out + 4, (params->threadgroup_memory_bytes << 2) | 0x80);
+      uint32_t word = (params->threadgroup_memory_bytes << 2) | 0x80;
+      write16(out + 4, word);
+      out[6] = word >> 16;
    } else if (stage == AGX_APPLE9_LAUNCH_FRAGMENT) {
       unsigned units = (params->tile_bytes + 7) / 8;
       if (params->samples == 4) {

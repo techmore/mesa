@@ -5,7 +5,34 @@ and launch records (`hk_apple9.c`). Graphics are not supported. This note
 records what was measured on hardware: an M4 Mac mini (Mac16,10, G16G,
 16 GB), Gravity's `linux-gravity-m4` 7.1.13 kernel, Omarchy 4.0.
 
-## LLM survey (omarchy-mlx v0.7.35, mlx-lm 0.31.3)
+## Current results (2026-11-01)
+
+This branch (cooperative matrix on by default), techmore/omarchy-mlx
+`m4-bf16-qmm-fma`, mlx-lm 0.32.0 with the omarchy serve patches. Decode:
+32 new tokens, greedy, chat prompt. Prefill: 512-token prompt
+(`prefill_bench.py`, best of three). Greedy text is unchanged against the
+earlier routes on every model listed; no run logged a GPU fault.
+
+| Model (mlx-community) | Decode tok/s | Prefill tok/s | Start of port (decode / prefill) |
+|---|---:|---:|---:|
+| Qwen2.5-1.5B-Instruct-4bit | 62.2 | 386 | 31.0 / 31.7 |
+| gemma-3-1b-it-4bit | 51.3 | 415 | 34.8 / 24.1 |
+| granite-4.0-1b-4bit | 48.0 | 375 | 31.9 / 20.6 |
+| Qwen3.5-2B-MLX-4bit | 44.7 | 421 | 23.3 / 15.6 |
+| Llama-3.2-1B-Instruct-4bit | 31.5 | 475 | 27.4 / 52.3 |
+| Llama-3.2-1B-Instruct-8bit | 28.8 | 481 | 25.9 / 26.4 |
+| Qwen3.5-4B-MLX-4bit | 21.3 | 170 | 11.1 / 6.3 |
+| Llama-3.2-1B-Instruct-bf16 | 20.0 | 413 | 16.8 / 42.7 |
+| Mistral-7B-Instruct-v0.3-4bit | 19.2 | 90 | 12.7 / 3.5 |
+
+Decode for Qwen2.5 1.5B, granite, Mistral and Llama 8-bit includes
+omarchy-mlx's in-place nibble decode (`83ae764`); the other rows were
+measured on the commit before it, which is about 2% slower on 4-bit models.
+The start-of-port prefill column is the survey below (a 44-token prompt);
+the 512-token numbers before cooperative matrix were 29-326 tok/s (see
+"VK_KHR_cooperative_matrix on Apple9").
+
+## LLM survey at the start of the port (omarchy-mlx v0.7.35, mlx-lm 0.31.3)
 
 Method: chat-templated prompt "Explain in plain language how a rainbow forms.
 Give four distinct sentences.", greedy decoding, 32 new tokens, one warmup and
@@ -518,6 +545,78 @@ Results on the M4, no GPU faults in any run:
   Mistral 7B. Decode is unchanged (Llama 1B 23.6 vs 25.7, granite 33.4 vs
   32.9 tok/s, other agents sharing the GPU).
 
+## Loop-carried values keep their registers
+
+Apple9 allocates with late-killed sources, so a result never took the
+register of a source dying at the same instruction. Every loop-carried
+value then landed in a fresh register and the backedge phi copies rotated
+it back: a 16-chain fma loop compiled to 16 fmas plus 17 register moves per
+iteration. Single-instruction ALU results (float and half
+add/mul/fma/min/max, integer add/mul/mad, logic, shifts, select) may now
+take a dying source's register when their encoding can name it, preferring
+the source in the result's phi web (`agx_ra_target.reuse_killed_source`).
+Expansions that write a result in parts keep late kill: the paired half pack
+refuses an aliased source in the pack step, which is how the list was
+narrowed. `AGX_APPLE9_NO_SOURCE_REUSE=1` restores the old allocation.
+
+The fma loop drops its moves (FMA-bound kernel 1486 to 2465 GFLOP/s), and
+MLX decode gains 2-7% (Qwen2.5 0.5B 87.8 to 94.0 tok/s, granite 45.8 to
+47.2), prefill 2-3%.
+
+## Subgroup barriers
+
+`subgroupBarrier()` was rejected. Apple's G16 compiler emits no instruction
+for `simdgroup_barrier` with `mem_none`, `mem_threadgroup` or `mem_device`
+(the code is the same length as with no barrier; `threadgroup_barrier` adds
+a 6-byte barrier each), so a SIMD group's threadgroup accesses stay in
+program order in hardware. The backend already keeps them in program order,
+so a subgroup-scope barrier lowers to nothing for shared memory and keeps
+the device fence for device memory. omarchy-mlx's Qwen3.5 gated-delta
+prefill kernels need it once mlx-lm 0.32 routes to them: Qwen3.5 2B
+512-token prefill 74 to 421 tok/s, 4B 31 to 170.
+
+## Op issue rates and memory bandwidth (T8132)
+
+Issue rate, 16 independent chains of one op, giga lane-ops per second
+(`op_rate.py` in omarchy-mlx `tools/m4-bw-probe`):
+
+| fma | fadd/fmul | iadd | iand | ior | shifts | imul | u32 to f32 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1231 | 1368 | 1288 | ~1550 | 613 | ~800 | 495 | ~660 |
+
+Or, shifts, multiplies and conversions are the slow ops: prefer add for
+disjoint bit fields and avoid shifts in inner loops. The FMA rate implies
+the GPU runs at its top state (about 1.5 GHz) under load.
+
+Streaming read bandwidth (`vkbw`, 512 MiB-1 GiB, xor-reduce) depends on the
+load width and nothing else measured:
+
+| Load | GB/s |
+|---|---:|
+| 32-bit | 66-71 |
+| 64-bit | 74-77 |
+| 128-bit | 78-82 |
+
+It does not change with the memory type (host-cached or not), occupancy
+(2,560 to 1.3 million threads), loads in flight per thread (1-8), or CPU
+frequency (0.9-4.1 GHz). All ten CPU cores read 71 GB/s. A published
+macOS measurement of the base M4 reaches about 100 GB/s (arXiv
+2502.05317), so the system ceiling here is roughly 18% lower, probably a
+memory power state; nothing on the Linux side requests one.
+
+A dependent Vulkan dispatch costs about 2.6 us of fixed time (a 1 MiB read
+takes 15.4 us against 12.8 us of bandwidth); pipeline barriers add nothing.
+
+The decode GEMV (`qmm_vec` Q4 word subgroup, 58 GPRs) streams 62-66 GB/s at
+large shapes. A shader that mimics its exact access mix (64-bit weight
+loads, uvec4 x loads, 16-bit scale and bias) reads 85 GB/s, and keeps 82-84
+GB/s with one-shot workgroups, 24 to 58 GPRs, or up to ~64 dependent fmas
+per row between loads; 128-bit weight loads do not help (81 GB/s). So the
+gap is the overlap of the GEMV's ~225 instructions per iteration with its
+loads, not the access pattern, register count or dispatch cost.
+omarchy-mlx `qmm_vec` now decodes nibbles in place without shifts (same
+bits, about 2% decode).
+
 ## Kernel
 
 The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
@@ -541,26 +640,20 @@ switch for the base M4 until Gravity publishes a qualified build.
 
 ## Open work
 
+- Decode GEMV: overlap the next iteration's weight loads with the current
+  iteration's math (software prefetch keeps results bit-exact), and keep
+  cutting instructions per byte (see "Op issue rates and memory bandwidth").
+- System memory ceiling: GPU reads stop near 82-85 GB/s, the CPU near 71,
+  against about 100 GB/s on macOS. Likely a memory performance state that
+  nothing on Linux requests.
+- Loops still rematerialize constants every iteration and spend a few
+  instructions on control.
+- Cooperative matrix: fold load waits into the instruction's wait mask, map
+  the fp16-accumulator form, and advertise fp16 and 16x16 shapes once tested
+  more widely.
+- Per-lane shuffle operands still use the broadcast fallback (the native
+  form takes constant or uniform operands only); Metal's four-shuffle
+  expansion of `simd_shuffle` is not decoded yet.
 - Descriptor-table graphics shaders still use the table path (the preamble
   roots are enabled for compute only).
-- Reduce the GEMV floor on small layers (512 x 2048 still takes about 35 us).
-  Load scheduling is ruled out (see "Latency-aware candidate selection");
-  candidates are the kernel's per-slot structure, splitting K in the MLX
-  kernels, and per-dispatch cost.
-- Upstream the bf16 FMA route to omarchy-mlx (techmore/omarchy-mlx `bf1406e`).
-- Cooperative matrix for Apple9, for prefill beyond the FMA kernels. Joshua
-  Warren's G13 Honeykrisp (github.com/joshuaswarren/mesa-1, branches
-  `asahi/hwmat-vec2-on` and `agent/hk-bf16-cmat`) gets about 2x over the FMA
-  kernel on an M1 from simdgroup matrix instructions; the Apple9 encodings
-  would come from the Xcode Metal toolchain as the subgroup ones did.
-- Per-lane shuffle operands still use the broadcast fallback; Metal's
-  four-shuffle expansion of `simd_shuffle` is not decoded yet.
-
-- Cooperative matrix: fold load waits into the instruction's wait mask,
-  map the fp16-accumulator form, and advertise fp16 and 16x16 shapes once
-  tested more widely.
-- Shuffles still use the broadcast fallback. Apple's Metal compiler output
-  for applegpu_g16g shows xor/up/down with immediate offsets as single
-  instructions (`c7 04` xor, `c7 05` down, `47 05` up, offset in byte 6), not
-  yet wired in.
 - Apple9 pipelines are not stored in the pipeline cache.

@@ -66,8 +66,43 @@ models) routes decode GEMV around the fused descriptor-table kernel:
 | granite-4.0-1b-4bit | 30.0 | 38.4 | 38.4 |
 | Llama-3.2-3B-Instruct-4bit | 11.0 | 12.2 | 13.3 |
 
-`MLX_OMARCHY_QMM_VEC_Q4_WORD=0` is a large regression on this hardware
-(granite: 4.2 tok/s); keep the default.
+With fusion off, a sweep of the other decode switches on granite 1B found
+nothing better than 38.4 tok/s: `SDPA_DECODE_SPLIT`, `SDPA_SPLIT_PV`,
+`SDPA_DECODE_BATCH`, `QMV_BATCH`, `ROPE_VECTOR_OFFSET`,
+`LSE_ARGREDUCE_PREFETCH`, `OUTGATE_FOLD` and `FUSED_CHAIN` all land within 1%.
+Two settings are large regressions on this hardware; keep their defaults:
+`MLX_OMARCHY_QMM_VEC_Q4_WORD=0` (4.2 tok/s) and
+`MLX_OMARCHY_SDPA_DECODE_NATIVE=0` (29.7 tok/s).
+
+## Why small GEMVs are latency-bound
+
+A thread issuing four independent 128-bit loads per loop iteration gains only
+1.17x over one load when few threads are resident (4 workgroups: 14.2 vs
+12.1 GB/s), so loads within a thread are effectively serialized. The cause is
+in the Apple9 back end, not in instruction order: selection and the VIR
+optimizer keep the four loads together, but `apple9_schedule_physical`
+(`agx_apple9_ra.c`) retires a pending load as soon as a later instruction
+writes any register the load *read*. After allocation the index register of a
+load is reused immediately by the next address computation, so every load is
+retired (identity bridge with a scoreboard wait) right after it issues.
+
+Moving loads earlier in NIR, waiting at the first consumer instead of after
+the producer, and skipping `agx_pressure_schedule` were all tried and changed
+nothing measurable (granite decode 38.3-38.5 tok/s either way, so they are not
+merged). The fix is
+either to show the hardware latches a device load's index at issue (then the
+write-after-read check can exempt device-load sources), or to keep each load's
+index register live until the load's first consumer during allocation.
+
+## Kernel
+
+The Mini runs Omarchy's `linux-gravity-m4` 7.1.13 package. Gravity's
+`replacement/210-gpu` branch (Linux 7.3) adds a much larger shared G16C/G17P
+driver (M4 Pro/Max), integrated in one commit that states it is not hardware
+qualified; it keeps the ordinary M4 driver. Its compute changes are M4 Max
+validated only. Completion polling at 200 us is shared code; with batching a
+decode token waits about once, so it costs under 1% today. Not worth a kernel
+switch for the base M4 until Gravity publishes a qualified build.
 
 ## Driver changes in this commit
 
@@ -84,8 +119,9 @@ models) routes decode GEMV around the fused descriptor-table kernel:
 
 - Make the descriptor-table ABI (more than 18 resources) as fast as the
   direct-buffer ABI, or lift the 18-resource direct limit.
-- Reduce the GEMV latency floor on small layers (load overlap within a thread,
-  or split-K in the kernels).
+- Reduce the GEMV latency floor on small layers: let device loads overlap
+  within a thread (see "Why small GEMVs are latency-bound"), or split K in the
+  MLX kernels.
 - Cooperative matrix for Apple9, for prefill.
 - Shuffles still use the broadcast fallback. Apple's Metal compiler output
   for applegpu_g16g shows xor/up/down with immediate offsets as single

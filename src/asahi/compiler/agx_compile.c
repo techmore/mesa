@@ -9853,6 +9853,203 @@ set_speculate(nir_builder *b, nir_instr *instr, UNUSED void *_)
    return false;
 }
 
+/*
+ * `cond ? buffer[i] : 0` over a read-only buffer reaches us as an if around a
+ * global load. Peephole select leaves such a load under its branch, since the
+ * branch may be what keeps the address valid, so in a loop every guarded
+ * value becomes a phi that the register allocator reconciles at each join.
+ *
+ * In a short arm of only ALU, preamble reads and read-only global loads, read
+ * the zero page instead when the arm is not taken. That address is always
+ * mapped and at least AGX_ZERO_PAGE_SIZE long, and the select formed from
+ * the if discards the value, so the load is safe to execute either way, with
+ * or without soft faults. Loads the driver already marked speculatable
+ * (descriptor reads) keep their address. Read-only, reorderable global loads
+ * become load_global_constant, the form peephole select knows, and
+ * flattening is requested for that if alone; other loads keep their
+ * branches. This runs before soft-fault speculation marks every load.
+ */
+static bool
+agx_guarded_load(nir_intrinsic_instr *intr)
+{
+   if (intr->intrinsic != nir_intrinsic_load_global_constant &&
+       intr->intrinsic != nir_intrinsic_load_global)
+      return false;
+   enum gl_access_qualifier access = nir_intrinsic_access(intr);
+   if ((access & (ACCESS_VOLATILE | ACCESS_COHERENT)) ||
+       intr->def.num_components * intr->def.bit_size > 128)
+      return false;
+   return intr->intrinsic == nir_intrinsic_load_global_constant ||
+          ((access & ACCESS_NON_WRITEABLE) && (access & ACCESS_CAN_REORDER));
+}
+
+static bool
+agx_guarded_load_arm_ok(nir_block *block)
+{
+   unsigned count = 0;
+   nir_foreach_instr(instr, block) {
+      switch (instr->type) {
+      case nir_instr_type_alu:
+      case nir_instr_type_load_const:
+      case nir_instr_type_undef:
+         break;
+      case nir_instr_type_intrinsic: {
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_load_preamble &&
+             !agx_guarded_load(intr))
+            return false;
+         break;
+      }
+      default:
+         return false;
+      }
+      if (++count > 64)
+         return false;
+   }
+   return true;
+}
+
+/* The zero-page address a load reads when its arm is not taken. The load
+ * keeps its alignment facts, which later passes (the load/store vectorizer)
+ * rely on, so they must hold for this address too. AGX_ZERO_PAGE_ADDRESS is
+ * 4 GiB aligned, a multiple of any align_mul, so the page base plus
+ * align_offset satisfies them and the read stays inside the page. If it
+ * would not, weaken the facts to what the page base satisfies: the largest
+ * power of two dividing align_offset, offset 0.
+ */
+static uint64_t
+agx_guarded_fallback(nir_intrinsic_instr *intr, unsigned *align_mul,
+                     unsigned *align_offset)
+{
+   STATIC_ASSERT((AGX_ZERO_PAGE_ADDRESS & ((1ull << 32) - 1)) == 0);
+   const unsigned bytes = intr->def.num_components * intr->def.bit_size / 8;
+   *align_mul = nir_intrinsic_align_mul(intr);
+   *align_offset = nir_intrinsic_align_offset(intr);
+
+   if (*align_offset + bytes <= AGX_ZERO_PAGE_SIZE)
+      return AGX_ZERO_PAGE_ADDRESS + *align_offset;
+
+   *align_mul = *align_offset & -*align_offset;
+   *align_offset = 0;
+   return AGX_ZERO_PAGE_ADDRESS;
+}
+
+/* The address an arm's load uses: `fallback` when the arm is not taken.
+ * Keep the base + 32-bit index shape agx_nir_lower_address folds into the
+ * load, selecting the base and the unscaled index rather than the 64-bit
+ * sum: fallback + 0.
+ */
+static nir_def *
+agx_guarded_address(nir_builder *b, nir_def *addr, nir_def *cond,
+                    bool taken_if_true, uint64_t fallback)
+{
+   nir_def *fallback_addr = nir_imm_int64(b, fallback);
+#define AGX_GUARD(taken, other)                                                \
+   (taken_if_true ? nir_bcsel(b, cond, taken, other)                          \
+                  : nir_bcsel(b, cond, other, taken))
+
+   nir_alu_instr *add = nir_def_as_alu_or_null(addr);
+   if (add && add->op == nir_op_iadd) {
+      for (unsigned i = 0; i < 2; ++i) {
+         nir_alu_instr *cvt = nir_def_as_alu_or_null(add->src[1 - i].src.ssa);
+         if (!cvt || (cvt->op != nir_op_u2u64 && cvt->op != nir_op_i2i64) ||
+             nir_src_bit_size(cvt->src[0].src) != 32)
+            continue;
+
+         nir_def *base = nir_ssa_for_alu_src(b, add, i);
+         nir_def *index = nir_ssa_for_alu_src(b, cvt, 0);
+         nir_def *zero = nir_imm_int(b, 0);
+         nir_alu_instr *scale = nir_def_as_alu_or_null(index);
+         nir_def *guarded;
+         if (scale && (scale->op == nir_op_imul || scale->op == nir_op_amul ||
+                       scale->op == nir_op_ishl) &&
+             nir_src_is_const(scale->src[1].src)) {
+            nir_def *unscaled = nir_ssa_for_alu_src(b, scale, 0);
+            guarded = nir_build_alu2(b, scale->op, AGX_GUARD(unscaled, zero),
+                                     nir_ssa_for_alu_src(b, scale, 1));
+         } else {
+            guarded = AGX_GUARD(index, zero);
+         }
+         return nir_iadd(b, AGX_GUARD(base, fallback_addr),
+                         nir_build_alu1(b, cvt->op, guarded));
+      }
+   }
+
+   return AGX_GUARD(addr, fallback_addr);
+#undef AGX_GUARD
+}
+
+/* Returns whether the arm had a load to redirect. */
+static bool
+agx_redirect_arm_loads(nir_block *block, nir_def *cond, bool taken_if_true)
+{
+   bool loads = false;
+   nir_foreach_instr_safe(instr, block) {
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if (intr->intrinsic == nir_intrinsic_load_preamble)
+         continue;
+      enum gl_access_qualifier access = nir_intrinsic_access(intr);
+      if (intr->intrinsic == nir_intrinsic_load_global_constant &&
+          (access & ACCESS_CAN_SPECULATE))
+         continue;
+
+      nir_builder b = nir_builder_at(nir_before_instr(instr));
+      nir_def *addr = intr->src[0].ssa;
+      unsigned align_mul = nir_intrinsic_align_mul(intr);
+      unsigned align_offset = nir_intrinsic_align_offset(intr);
+      if (!(access & ACCESS_CAN_SPECULATE)) {
+         const uint64_t fallback =
+            agx_guarded_fallback(intr, &align_mul, &align_offset);
+         addr = agx_guarded_address(&b, addr, cond, taken_if_true, fallback);
+      }
+      nir_def *value = nir_load_global_constant(
+         &b, intr->def.num_components, intr->def.bit_size, addr,
+         .align_mul = align_mul,
+         .align_offset = align_offset,
+         .access = access | ACCESS_CAN_SPECULATE);
+      nir_def_replace(&intr->def, value);
+      loads = true;
+   }
+   return loads;
+}
+
+bool
+agx_nir_speculate_guarded_loads(nir_shader *nir)
+{
+   if (!mesa_shader_stage_is_compute(nir->info.stage))
+      return false;
+
+   bool progress = false;
+   nir_foreach_function_impl(impl, nir) {
+      bool impl_progress = false;
+      nir_foreach_block(block, impl) {
+         nir_cf_node *next = nir_cf_node_next(&block->cf_node);
+         if (!next || next->type != nir_cf_node_if)
+            continue;
+         nir_if *nif = nir_cf_node_as_if(next);
+         nir_block *then_block = nir_if_first_then_block(nif);
+         nir_block *else_block = nir_if_first_else_block(nif);
+         if (nif->control == nir_selection_control_dont_flatten ||
+             then_block != nir_if_last_then_block(nif) ||
+             else_block != nir_if_last_else_block(nif) ||
+             !agx_guarded_load_arm_ok(then_block) ||
+             !agx_guarded_load_arm_ok(else_block))
+            continue;
+         nir_def *cond = nif->condition.ssa;
+         bool loads = agx_redirect_arm_loads(then_block, cond, true);
+         loads |= agx_redirect_arm_loads(else_block, cond, false);
+         if (loads) {
+            nif->control = nir_selection_control_flatten;
+            impl_progress = true;
+         }
+      }
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+   return progress;
+}
+
 static bool agx_g17p_discard_word(nir_shader *nir);
 static bool agx_m5_discard_word(nir_shader *nir);
 
@@ -10162,6 +10359,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, bool uniform_atomics,
       if (lowered)
          agx_optimize_loop_nir(nir, m5, g17p);
    }
+
+   /* ASAHI_NO_GUARDED_LOAD_SELECT=1 keeps guarded loads under their branch
+    * for A/B comparisons. */
+   if (!debug_get_bool_option("ASAHI_NO_GUARDED_LOAD_SELECT", false))
+      NIR_PASS(_, nir, agx_nir_speculate_guarded_loads);
 
    /* If soft fault is enabled, we can freely speculate everything. That lets us
     * peephole select and form preambles more aggressively.

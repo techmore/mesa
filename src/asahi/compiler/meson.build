@@ -604,6 +604,7 @@ if with_tests
     executable(
       'agx_tests',
       files(
+         '../lib/agx_chip.c',
          'test/test-compact-constants.cpp',
          'test/test-agx3-pack-binary.cpp',
          'test/test-minifloat.cpp',
